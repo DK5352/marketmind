@@ -1,0 +1,285 @@
+================================================================================
+  MARKETMIND — SYSTEM OVERVIEW
+================================================================================
+
+WHAT IS MARKETMIND?
+--------------------
+A personal AI wealth manager that runs on your computer. It monitors the stock
+market daily, analyses data from 13 different sources, and gives you specific
+investment recommendations — all explained in plain English for a beginner.
+
+
+================================================================================
+THE 4 MODES (MAIN MENU)
+================================================================================
+
+1. DAILY WEALTH REPORT
+-----------------------
+Your day-to-day portfolio manager. Every time you run it:
+  - Reads your current portfolio (cash + holdings)
+  - Screens all stocks in your investment universe
+  - Analyses each stock you currently hold
+  - Gives specific BUY / SELL / HOLD recommendations with exact share counts
+    and prices
+  - Tracks whether you are on pace for your weekly return target
+  - Flags risks, insider selling, and unusual social activity
+  - Saves a dated report to reports/report_YYYY-MM-DD.md
+
+
+2. STOCK FORECAST
+------------------
+For when you hear news about a stock and want to know if you should invest.
+You type any ticker (e.g. TSLA) and it:
+  - Reads all recent news and rates each story:
+      Bullish / Bearish / Neutral + LOW / MEDIUM / HIGH / MAJOR impact
+  - Checks if the market has already priced in the news
+  - Combines news impact with technical signals
+  - Gives a verdict: STRONG BUY / BUY / WAIT / AVOID / STRONG AVOID
+  - With: confidence score (X/10), entry price, stop-loss, target price,
+    and time horizon
+  - Ends with a plain-English beginner's summary
+  - Saves forecast to reports/forecast_TICKER_YYYY-MM-DD.md
+
+
+3. TOP 10 US STOCKS SNAPSHOT
+------------------------------
+A live comparison table of the 10 biggest US companies:
+Apple, Microsoft, NVIDIA, Amazon, Alphabet, Meta,
+Berkshire Hathaway, Eli Lilly, Broadcom, Tesla
+
+  Column       What it shows
+  ----------   -------------------------------------------------------
+  Today $      Live market price right now
+  Target $     Where Wall Street analysts think it will be in 12 months
+  Upside       Gap between today's price and analyst target
+  7-Day        How much it moved this week
+  AI (date)    MarketMind's predicted price in 7 days
+  Conf.        How many technical indicators agree (High/Medium/Low)
+  Predict?     How trustworthy the prediction is + beta coefficient
+  Rating       Wall Street consensus (Strong Buy to Sell)
+
+Saves to reports/top10_snapshot_YYYY-MM-DD.txt
+
+
+4. BACKTEST MARKETMIND PREDICTIONS
+------------------------------------
+Tests how accurate MarketMind would have been last week:
+  - Goes back 7 trading days and pretends it is running on that date
+  - Uses only data that was available on that date (no cheating)
+  - Generates the same predictions it would have made then
+  - Compares predicted price vs what actually happened
+  - Shows: error %, direction accuracy (did it call UP/DOWN correctly?),
+    and an overall accuracy summary
+  - Saves to reports/backtest_DATE_to_DATE.txt
+
+
+================================================================================
+THE DATA ENGINE (13 SOURCES)
+================================================================================
+
+  Source              What we get                            Cost
+  ---------------     ------------------------------------   -------------------
+  Yahoo Finance       Prices, technicals, fundamentals       Free
+  Finnhub             News headlines and summaries           Free (60 calls/min)
+  StockTwits          Bullish/bearish sentiment ratio        Free
+  Reddit              Mention counts across                  Free
+                      r/wallstreetbets, r/stocks,
+                      r/investing
+  Alpha Vantage       Income statements, balance sheets,     Free (25 calls/day)
+                      earnings history
+  SEC EDGAR           Insider trades (Form 4),               Free
+                      10-K and 10-Q filings
+  Anthropic Claude    AI analysis and predictions            Pay per use
+
+
+================================================================================
+TECHNICAL INDICATORS CALCULATED
+================================================================================
+
+  Indicator                  What it detects
+  -------------------------  --------------------------------------------------
+  RSI (14-day)               Overbought (above 70) or oversold (below 30)
+  MACD                       Momentum building or fading
+  EMA 20-day                 Short-term trend direction
+  EMA 200-day                Long-term trend direction
+  Bollinger Bands            Price near upper or lower extremes
+  Stochastic Oscillator      Another overbought/oversold signal
+  50-day SMA                 Medium-term trend
+  200-day SMA                Long-term trend
+  Volume Spike               Unusual buying or selling activity
+
+
+================================================================================
+FUNDAMENTAL DATA TRACKED
+================================================================================
+
+  For each stock we track:
+  - P/E ratio, Forward P/E, Price-to-Book, Price-to-Sales
+  - EPS (Earnings Per Share)
+  - Revenue (trailing 12 months) and Revenue growth year-over-year
+  - Profit margin and Return on equity
+  - Debt-to-equity ratio, Total debt, Total cash
+  - Market capitalisation
+  - Dividend yield and Dividend rate
+  - 52-week high and low
+  - Analyst consensus rating and mean price target
+  - Next earnings date
+
+
+================================================================================
+PORTFOLIO STATE SYSTEM
+================================================================================
+
+Everything is saved in portfolio_state.json between daily runs:
+
+  Field                  What it tracks
+  --------------------   -------------------------------------------------------
+  cash_available         Uninvested money ready to deploy
+  holdings               Each stock owned: shares, avg buy price, live P&L
+  transaction_history    Every buy and sell ever recorded
+  realized_gains         Profits locked in from completed sales
+  total_return_pct       Overall return since day one
+  start_date / end_date  The 6-month investment period window
+
+
+================================================================================
+PREDICTABILITY SCORING
+================================================================================
+
+Before making any prediction, MarketMind scores how reliable that prediction
+is based on 30-day historical volatility and beta coefficient.
+
+  Score    Criteria                          What it means
+  ------   --------------------------------  -----------------------------------
+  High     Volatility < 20% AND beta < 1.2  Stable stock. Technicals are
+                                            reliable. Trust the prediction more.
+  Medium   Volatility 20-35% or beta 1.2-   Some noise. Prediction is a good
+           1.8                              guide but watch for surprises.
+  Low      Volatility > 35% or beta > 1.8   High-volatility stock (e.g. Tesla).
+                                            News and sentiment can override
+                                            technicals at any time.
+
+Why Tesla predictions are less reliable than Apple or Microsoft:
+  - Tesla beta is around 2.3 (moves 2.3x the market)
+  - 30-day volatility is very high
+  - A single tweet or news story can move it more than a full week of
+    technical signals would predict
+
+
+================================================================================
+SETUP AND CONFIGURATION
+================================================================================
+
+At first run you are asked two questions:
+
+  1. How much to invest — your starting capital (e.g. $10,000)
+
+  2. Risk appetite:
+       Conservative  — 1.0% weekly target, stable dividend-paying stocks,
+                       capital preservation is the priority
+       Moderate      — 2.0% weekly target, mix of stable and growth stocks
+       Aggressive    — 3.5% weekly target, momentum and growth stocks,
+                       higher risk for higher potential reward
+
+On every return visit it asks if you want to update your risk level.
+
+Investment rules built in:
+  - No new money added for 6 months
+  - Profits are reinvested (compounding)
+  - No single stock can exceed 20% of total portfolio value
+  - Stop-loss logic: flag stocks down more than 8% from buy price
+
+
+================================================================================
+FILE STRUCTURE
+================================================================================
+
+  marketmind/
+  |-- stock_friend.py               The entire agent (all tools, logic, modes)
+  |-- portfolio_state.json          Your live portfolio (auto-created on first run)
+  |-- requirements.txt              anthropic, yfinance, python-dotenv,
+  |                                 python-dateutil
+  |-- .env                          Your API keys (you create this from template)
+  |-- .env.example                  Template showing what keys are needed
+  |-- .gitignore                    Keeps .env and .venv out of git
+  |-- Knowledge_Base.md             Project documentation
+  |-- MarketMind_System_Overview.txt  This file
+  |-- reports/
+      |-- report_YYYY-MM-DD.md          Daily wealth reports
+      |-- forecast_TICKER_YYYY-MM-DD.md Stock forecasts
+      |-- top10_snapshot_YYYY-MM-DD.txt Snapshot tables
+      |-- backtest_DATE_to_DATE.txt     Backtest results
+
+
+================================================================================
+HOW IT ALL CONNECTS
+================================================================================
+
+  You run stock_friend.py
+          |
+          v
+  Ask risk appetite (first run) or confirm (returning user)
+          |
+          v
+  Choose mode:
+    1. Daily Report
+    2. Stock Forecast
+    3. Top 10 Snapshot
+    4. Backtest
+          |
+          v
+  MarketMind fetches data from 13 sources using its built-in tools
+          |
+          v
+  All data is sent to Claude (claude-opus-4-6)
+          |
+          v
+  Claude analyses everything and writes the report
+          |
+          v
+  Report printed to screen + saved to reports/ folder
+
+
+================================================================================
+API KEYS REQUIRED
+================================================================================
+
+  Key                    Where to get it                    Cost
+  --------------------   --------------------------------   -------------------
+  ANTHROPIC_API_KEY      console.anthropic.com              Pay per use
+  FINNHUB_API_KEY        finnhub.io                         Free, no credit card
+  ALPHA_VANTAGE_API_KEY  alphavantage.co                    Free, 25 calls/day
+
+  SEC EDGAR and Yahoo Finance require no API key.
+  StockTwits and Reddit use public APIs with no key required.
+
+  Add all keys to a file called .env in the marketmind folder:
+    ANTHROPIC_API_KEY=your_key_here
+    FINNHUB_API_KEY=your_key_here
+    ALPHA_VANTAGE_API_KEY=your_key_here
+
+
+================================================================================
+HOW TO RUN
+================================================================================
+
+  cd /Users/divyakapoor/marketmind
+  .venv/bin/python stock_friend.py
+
+  On first run it will ask for your investment amount and risk appetite,
+  then create portfolio_state.json automatically.
+
+  Run it daily for best results. Use option 4 (Backtest) regularly to
+  track how accurate the predictions are over time.
+
+
+================================================================================
+DISCLAIMER
+================================================================================
+
+  MarketMind provides AI-generated investment suggestions for educational
+  purposes only. It is NOT a licensed financial advisor. All investment
+  decisions are yours alone. Stock markets carry risk — you can lose money.
+  Never invest more than you can afford to lose.
+
+================================================================================

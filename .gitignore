@@ -1,0 +1,23 @@
+# API keys — never commit these
+.env
+
+# Streamlit local secrets (use Streamlit Cloud dashboard instead)
+.streamlit/secrets.toml
+
+# Personal portfolio data
+portfolio_state.json
+profiles/
+
+# Generated reports (optional — remove these lines if you want reports in git)
+reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store

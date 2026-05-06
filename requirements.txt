@@ -1,0 +1,7 @@
+anthropic
+yfinance
+python-dotenv
+python-dateutil
+streamlit
+pdfplumber
+pandas
