@@ -77,6 +77,7 @@ import json
 import os
 import random
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 
@@ -96,10 +97,112 @@ TRADING_CONFIG = {
     "risk_per_trade_pct":     2.0,       # Max % of capital to risk on a single trade
     "trading_style":          "swing",   # "swing" (1-5 days) or "momentum" (days-weeks)
     "risk_level":             "moderate",# "conservative", "moderate", or "aggressive"
+    "trading_persona":        "swing",   # "day", "swing", or "longterm"
 }
 # conservative = only high-predictability stocks, tight stop-losses
 # moderate     = mix of setups, standard risk sizing
 # aggressive   = momentum plays, wider stop-losses, higher position sizes
+
+# ── Persona Configurations ────────────────────────────────────────────────────
+# Each persona sets the default trading parameters and scoring weights.
+# Stored per-profile in portfolio_state.json so different profiles can have
+# different personas (e.g. one profile for day trading, one for long-term).
+
+PERSONA_CONFIGS = {
+    "day": {
+        "label":            "Day Trading",
+        "emoji":            "⚡",
+        "description":      "Same-day exits. Fast, high-frequency setups. Exit before market close.",
+        "tagline":          "Hit fast, exit same day. Small gains compound — protect every cent.",
+        "take_profit_pct":  1.5,    # Small, quick gains
+        "stop_loss_pct":    0.75,   # Very tight — day traders can't afford big losses
+        "max_open_trades":  3,      # Fewer trades, more focus
+        "max_hold_days":    1,      # Exit same day
+        "risk_per_trade_pct": 1.0,  # Smaller risk per trade
+        "max_position_pct": 15.0,
+        # Indicator weights for scoring (higher = more important)
+        "weights": {
+            "volume":       3,   # Volume spikes are the #1 day-trading signal
+            "momentum":     2,   # Pre-market gap / price momentum
+            "rsi":          1,   # Short-term RSI matters less intraday
+            "macd":         1,
+            "ema200":       0,   # 200-day EMA irrelevant for same-day trades
+            "fundamentals": 0,   # Fundamentals don't matter within a day
+            "sentiment":    1,
+        },
+        "focus":   ["volume spike", "pre-market gap", "momentum breakout", "RSI extremes"],
+        "avoid":   ["low volume stocks", "stocks below 200-day EMA for multi-day holds"],
+        "hold_label": "Same day",
+        "target_label": "+1–2% per trade",
+    },
+    "swing": {
+        "label":            "Swing Trading",
+        "emoji":            "🔄",
+        "description":      "Hold 2–5 days. Capture short-term price moves of 3–8%.",
+        "tagline":          "Ride the wave, not the whole ocean. Enter on setups, exit with discipline.",
+        "take_profit_pct":  5.0,
+        "stop_loss_pct":    2.0,
+        "max_open_trades":  5,
+        "max_hold_days":    5,
+        "risk_per_trade_pct": 2.0,
+        "max_position_pct": 20.0,
+        "weights": {
+            "volume":       1,
+            "momentum":     2,
+            "rsi":          2,   # RSI setups are the core of swing trading
+            "macd":         2,   # MACD crossovers signal swing entries
+            "ema200":       1,
+            "fundamentals": 1,
+            "sentiment":    1,
+        },
+        "focus":   ["RSI oversold bounce", "MACD bullish crossover", "Bollinger Band squeeze breakout"],
+        "avoid":   ["stocks with no clear technical setup", "earnings week entries (gap risk)"],
+        "hold_label": "2–5 days",
+        "target_label": "+3–8% per trade",
+    },
+    "longterm": {
+        "label":            "Long-term Investing",
+        "emoji":            "📈",
+        "description":      "Hold 3–12 months. Focus on fundamentals, sector trends, and analyst consensus.",
+        "tagline":          "Buy quality, hold with conviction. Ignore short-term noise — let compounding work.",
+        "take_profit_pct":  25.0,   # Large target — let winners run
+        "stop_loss_pct":    8.0,    # Wider stop — normal pullbacks won't stop you out
+        "max_open_trades":  10,     # More diversification
+        "max_hold_days":    180,    # 6-month default hold window
+        "risk_per_trade_pct": 5.0,  # Larger position sizes — fewer, higher-conviction trades
+        "max_position_pct": 15.0,   # Slightly lower per-stock cap for diversification
+        "weights": {
+            "volume":       0,   # Volume noise irrelevant over months
+            "momentum":     1,
+            "rsi":          0,   # Short-term RSI is noise for long-term investors
+            "macd":         1,
+            "ema200":       3,   # 200-day EMA is the most important long-term trend signal
+            "fundamentals": 3,   # P/E, analyst rating, profit margin drive long-term returns
+            "sentiment":    1,
+        },
+        "focus":   ["above 200-day EMA", "strong analyst rating", "low P/E relative to sector",
+                    "positive revenue growth", "high profit margin"],
+        "avoid":   ["overvalued stocks (P/E > 50)", "companies with negative profit margins",
+                    "stocks in long-term downtrends (below 200-day EMA)"],
+        "hold_label": "3–12 months",
+        "target_label": "+15–30% per position",
+    },
+}
+
+
+def apply_persona(persona_key: str) -> None:
+    """
+    Applies a persona's settings to TRADING_CONFIG.
+    Called when loading a profile or changing persona.
+    """
+    cfg = PERSONA_CONFIGS.get(persona_key, PERSONA_CONFIGS["swing"])
+    TRADING_CONFIG["trading_persona"]    = persona_key
+    TRADING_CONFIG["take_profit_pct"]    = cfg["take_profit_pct"]
+    TRADING_CONFIG["stop_loss_pct"]      = cfg["stop_loss_pct"]
+    TRADING_CONFIG["max_open_trades"]    = cfg["max_open_trades"]
+    TRADING_CONFIG["max_hold_days"]      = cfg["max_hold_days"]
+    TRADING_CONFIG["risk_per_trade_pct"] = cfg["risk_per_trade_pct"]
+    TRADING_CONFIG["max_position_pct"]   = cfg["max_position_pct"]
 
 # Keep a reference to the original name for backward compatibility
 INVESTMENT_CONFIG = TRADING_CONFIG
@@ -182,6 +285,9 @@ def initialize_portfolio() -> dict:
     today = date.today().isoformat()
     end_date = (date.today() + relativedelta(months=6)).isoformat()
 
+    persona_key = cfg.get("trading_persona", "swing")
+    persona_cfg = PERSONA_CONFIGS.get(persona_key, PERSONA_CONFIGS["swing"])
+
     state = {
         "initial_investment": capital,
         "cash_available": capital,
@@ -191,6 +297,8 @@ def initialize_portfolio() -> dict:
         "investment_period_months": 6,
         "weekly_return_target_pct": 1.0,
         "risk_level": cfg["risk_level"],
+        "trading_persona": persona_key,
+        "persona_label": persona_cfg["label"],
         "holdings": {},
         "transaction_history": [],
         "realized_gains": 0.0,
@@ -1931,39 +2039,84 @@ def run_stock_forecast(ticker: str) -> str:
         if filings:
             lines.append(f"  Latest filing:  {filings[0].get('filed_date','N/A')}")
 
-    # Score
+    # ── Persona-aware scoring ─────────────────────────────────────────────────
+    persona_key = cfg.get("trading_persona", "swing")
+    persona_cfg = PERSONA_CONFIGS.get(persona_key, PERSONA_CONFIGS["swing"])
+    w           = persona_cfg["weights"]
+
     bull, bear = 0, 0
-    if rsi < 35:                                              bull += 2
-    elif rsi > 72:                                            bear += 2
-    elif 40 <= rsi <= 65:                                     bull += 1
 
-    if macd_sig == "bullish crossover":                       bull += 2
-    elif macd_sig == "bearish crossover":                     bear += 2
+    # RSI — weighted by persona
+    if w["rsi"] > 0:
+        if rsi < 35:               bull += 2 * w["rsi"]
+        elif rsi > 72:             bear += 2 * w["rsi"]
+        elif 40 <= rsi <= 65:      bull += 1 * w["rsi"]
 
-    if ema20 and cur and cur > ema20:                         bull += 1
-    elif ema20 and cur:                                       bear += 1
+    # MACD — weighted by persona
+    if w["macd"] > 0:
+        if macd_sig == "bullish crossover":   bull += 2 * w["macd"]
+        elif macd_sig == "bearish crossover": bear += 2 * w["macd"]
 
-    if ema200 and cur and cur > ema200:                       bull += 1
-    elif ema200 and cur:                                      bear += 2
+    # Momentum / EMA 20d
+    if w["momentum"] > 0 and ema20 and cur:
+        if cur > ema20:   bull += 1 * w["momentum"]
+        else:             bear += 1 * w["momentum"]
 
-    if bb_pct < 20:                                           bull += 1
-    elif bb_pct > 80:                                         bear += 1
+    # EMA 200d — most important for long-term
+    if w["ema200"] > 0 and ema200 and cur:
+        if cur > ema200:   bull += 1 * w["ema200"]
+        else:              bear += 2 * w["ema200"]
 
-    if vol_ratio >= 1.5 and macd_hist > 0:                    bull += 1
+    # Bollinger Bands (counts as momentum signal)
+    if w["momentum"] > 0:
+        if bb_pct < 20:    bull += 1
+        elif bb_pct > 80:  bear += 1
 
-    stw_bull = stw.get("bullish_pct") if not stw.get("error") else None
-    if stw_bull and stw_bull > 65:                            bull += 1
-    elif stw_bull and stw_bull < 35:                          bear += 1
+    # Volume spike (critical for day trading, ignored for long-term)
+    if w["volume"] > 0 and vol_ratio >= 1.5 and macd_hist > 0:
+        bull += 1 * w["volume"]
+    elif w["volume"] > 0 and vol_ratio < 0.7:
+        bear += 1 * w["volume"]
 
+    # Fundamentals — only weighted for long-term persona
+    if w["fundamentals"] > 0 and not fund.get("error"):
+        pe = fund.get("pe_ratio")
+        margin = fund.get("profit_margin", "")
+        rating = (fund.get("analyst_rating") or "").lower()
+
+        if rating in ("strong_buy", "buy"):      bull += 2 * w["fundamentals"]
+        elif rating in ("sell", "underperform"): bear += 2 * w["fundamentals"]
+
+        try:
+            if pe and float(pe) < 25:            bull += 1 * w["fundamentals"]
+            elif pe and float(pe) > 50:          bear += 1 * w["fundamentals"]
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            mp = float(str(margin).replace("%",""))
+            if mp > 15:                          bull += 1 * w["fundamentals"]
+            elif mp < 0:                         bear += 2 * w["fundamentals"]
+        except (TypeError, ValueError):
+            pass
+
+    # Sentiment
+    if w["sentiment"] > 0:
+        stw_bull = stw.get("bullish_pct") if not stw.get("error") else None
+        if stw_bull and stw_bull > 65:           bull += 1 * w["sentiment"]
+        elif stw_bull and stw_bull < 35:         bear += 1 * w["sentiment"]
+
+    # Verdict thresholds scale with how many weighted signals there are
     net = bull - bear
-    if   net >= 5:  verdict, conf = "STRONG BUY",    9
+    if   net >= 6:  verdict, conf = "STRONG BUY",    9
     elif net >= 3:  verdict, conf = "BUY",            7
     elif net >= 1:  verdict, conf = "WAIT",           5
     elif net >= -2: verdict, conf = "WAIT",           4
-    elif net >= -4: verdict, conf = "AVOID",          3
+    elif net >= -5: verdict, conf = "AVOID",          3
     else:           verdict, conf = "STRONG AVOID",   2
 
     lines.append(f"\n{'='*60}")
+    lines.append(f"  PERSONA:        {persona_cfg['emoji']} {persona_cfg['label']}")
     lines.append(f"  VERDICT:        {verdict}")
     lines.append(f"  CONFIDENCE:     {conf}/10  (bull signals: {bull}  |  bear signals: {bear})")
     lines.append(f"{'='*60}")
@@ -1972,32 +2125,82 @@ def run_stock_forecast(ticker: str) -> str:
         tp = round(cur * (1 + cfg["take_profit_pct"] / 100), 2)
         sl = round(cur * (1 - cfg["stop_loss_pct"]   / 100), 2)
         lines.append(f"\n  Entry price:    ${cur:.2f}")
-        lines.append(f"  Take-profit:    ${tp:.2f}  (+{cfg['take_profit_pct']}%)  ← exit here to lock in gain")
-        lines.append(f"  Stop-loss:      ${sl:.2f}  (-{cfg['stop_loss_pct']}%)   ← exit immediately if it drops here")
-        lines.append(f"  Max hold:       {cfg['max_hold_days']} days")
+        lines.append(f"  Take-profit:    ${tp:.2f}  (+{cfg['take_profit_pct']}%)  ← exit here")
+        lines.append(f"  Stop-loss:      ${sl:.2f}  (-{cfg['stop_loss_pct']}%)   ← exit immediately if hit")
+        lines.append(f"  Max hold:       {persona_cfg['hold_label']}")
+        lines.append(f"  Target range:   {persona_cfg['target_label']}")
 
+    # Persona-specific risks
     risks = []
-    if rsi > 65:                              risks.append(f"RSI elevated ({rsi}) — possible near-term pullback")
-    if ema200 and cur and cur < ema200:       risks.append("Trading below 200-day EMA — long-term downtrend in place")
-    if vol_ratio < 0.7:                       risks.append("Low volume — move may lack conviction")
-    if not risks:                             risks.append("Standard market risk — no setup is ever risk-free")
+    if persona_key == "day":
+        if vol_ratio < 1.5:
+            risks.append(f"Low volume ({vol_ratio:.1f}x avg) — day trades need volume to move")
+        if rsi > 70:
+            risks.append(f"RSI overbought ({rsi}) — intraday mean-reversion risk")
+        risks.append("Day trading risk: must exit before close or hold overnight unintentionally")
+    elif persona_key == "swing":
+        if rsi > 65:
+            risks.append(f"RSI elevated ({rsi}) — possible near-term pullback")
+        if ema200 and cur and cur < ema200:
+            risks.append("Trading below 200-day EMA — long-term downtrend")
+        if vol_ratio < 0.7:
+            risks.append("Low volume — breakout may lack conviction")
+    else:  # longterm
+        if not fund.get("error"):
+            pe = fund.get("pe_ratio")
+            try:
+                if pe and float(pe) > 40:
+                    risks.append(f"High P/E ({pe}) — valuation stretched; growth must justify it")
+            except (TypeError, ValueError):
+                pass
+        if ema200 and cur and cur < ema200:
+            risks.append("Below 200-day EMA — wait for trend reversal before long-term entry")
+        risks.append("Long-term risk: macro shifts (rates, recession) can override fundamentals")
+
+    if not risks:
+        risks.append("Standard market risk — no setup is ever risk-free")
 
     lines.append(f"\n## KEY RISKS")
     for r in risks[:3]:
         lines.append(f"  • {r}")
 
-    lines.append(f"\n## PLAIN ENGLISH SUMMARY")
+    # Persona-specific plain English summary
+    lines.append(f"\n## PLAIN ENGLISH SUMMARY  ({persona_cfg['label']})")
     if verdict in ("STRONG BUY", "BUY"):
-        lines.append(f"  {ticker} is showing bullish technical signals and momentum is pointing up.")
-        if cur:
-            lines.append(f"  If you buy near ${cur:.2f}, aim to exit at ${round(cur*1.05,2):.2f} (take profit)")
-            lines.append(f"  and sell immediately if it drops to ${round(cur*0.98,2):.2f} (stop loss).")
+        if persona_key == "day":
+            lines.append(f"  {ticker} has a volume spike and momentum signal — good intraday setup.")
+            if cur:
+                lines.append(f"  Buy near ${cur:.2f}, target ${round(cur*(1+cfg['take_profit_pct']/100),2):.2f}.")
+                lines.append(f"  Set a hard stop at ${round(cur*(1-cfg['stop_loss_pct']/100),2):.2f} and EXIT BEFORE MARKET CLOSE.")
+        elif persona_key == "swing":
+            lines.append(f"  {ticker} is showing bullish technicals — a solid 2–5 day swing setup.")
+            if cur:
+                lines.append(f"  Buy near ${cur:.2f}, target ${round(cur*(1+cfg['take_profit_pct']/100),2):.2f}, "
+                              f"stop at ${round(cur*(1-cfg['stop_loss_pct']/100),2):.2f}.")
+        else:  # longterm
+            lines.append(f"  {ticker} has strong fundamentals and is in a long-term uptrend.")
+            if cur:
+                lines.append(f"  Build a position near ${cur:.2f}. Target: ${round(cur*(1+cfg['take_profit_pct']/100),2):.2f} "
+                              f"(+{cfg['take_profit_pct']}%). Stop: ${round(cur*(1-cfg['stop_loss_pct']/100),2):.2f}.")
+                lines.append(f"  Hold for {persona_cfg['hold_label']} — ignore short-term volatility.")
     elif verdict == "WAIT":
-        lines.append(f"  {ticker} has mixed signals — not a clear entry point yet.")
-        lines.append(f"  Watch for RSI to dip below 65 and MACD to show a bullish crossover before entering.")
+        if persona_key == "day":
+            lines.append(f"  No clean intraday setup right now. Volume and momentum aren't aligned.")
+            lines.append(f"  Watch for a volume spike (>1.5x) with price breaking above resistance.")
+        elif persona_key == "swing":
+            lines.append(f"  {ticker} has mixed signals — not a clear swing entry yet.")
+            lines.append(f"  Watch for RSI to dip below 65 and MACD to show a bullish crossover.")
+        else:
+            lines.append(f"  Fundamentals are OK but the technical picture isn't confirmed yet.")
+            lines.append(f"  Wait for price to reclaim the 200-day EMA before adding a long-term position.")
     else:
-        lines.append(f"  {ticker} has bearish technical signals. This is not a good time to buy.")
-        lines.append(f"  Wait for a clearer setup before committing capital.")
+        if persona_key == "day":
+            lines.append(f"  {ticker} has no momentum or volume edge today. Skip — protect your capital.")
+        elif persona_key == "swing":
+            lines.append(f"  {ticker} has bearish signals. Not a swing trade candidate right now.")
+        else:
+            lines.append(f"  {ticker} has weak fundamentals or is in a downtrend. Avoid for long-term holding.")
+        lines.append(f"  Wait for a clearer setup.")
 
     lines.append(f"\n  DISCLAIMER: Educational purposes only. Always do your own research.")
     return "\n".join(lines)
@@ -2717,22 +2920,539 @@ def _save_forecast(ticker: str, report: str) -> str:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# ── Broker connection (multi-broker) ─────────────────────────────────────────
+
+ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
+ALPACA_LIVE_URL  = "https://api.alpaca.markets"
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _test_alpaca_connection(api_key: str, api_secret: str, base_url: str) -> dict:
+    """
+    Public helper — tests Alpaca credentials by hitting /v2/account.
+    Returns the account dict on success, or {"error": "..."} on failure.
+    Called by both the CLI flow and the Streamlit app.
+    """
+    url = f"{base_url}/v2/account"
+    req = urllib.request.Request(url, headers={
+        "APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}: {e.read().decode()}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _fetch_alpaca_positions(api_key: str, api_secret: str, base_url: str) -> list:
+    """
+    Public helper — fetches open positions from Alpaca /v2/positions.
+    Returns a list of position dicts, or [] on error.
+    Called by both the CLI flow and the Streamlit app.
+    """
+    url = f"{base_url}/v2/positions"
+    req = urllib.request.Request(url, headers={
+        "APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return []
+
+
+def _save_env_keys(new_values: dict, section_comment: str) -> None:
+    """
+    Upserts key=value pairs into the .env file.
+    Existing matching keys are overwritten in-place; new keys are appended
+    under section_comment. All writes stay local — never committed to git.
+    """
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    lines = open(env_path).readlines() if os.path.exists(env_path) else []
+
+    found, updated = set(), []
+    for line in lines:
+        k = line.split("=")[0].strip()
+        if k in new_values:
+            updated.append(f"{k}={new_values[k]}\n")
+            found.add(k)
+        else:
+            updated.append(line)
+
+    if not found:
+        updated.append(f"\n{section_comment}\n")
+    for k, v in new_values.items():
+        if k not in found:
+            updated.append(f"{k}={v}\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(updated)
+
+
+def _import_positions(state: dict, positions: list, broker_tag: str) -> dict:
+    """
+    Shared helper: offers to import a list of positions into portfolio state.
+    positions — list of dicts with keys: symbol, qty, avg_buy_price,
+                market_value, unrealized_pl, cash (account-level cash).
+    """
+    if not positions:
+        print("  No open positions found in your account.")
+        return state
+
+    print(f"\n  Found {len(positions)} open position(s):")
+    for p in positions:
+        sym     = p.get("symbol", "?")
+        qty     = p.get("qty", "?")
+        cost    = float(p.get("avg_buy_price", 0))
+        mval    = float(p.get("market_value",  0))
+        pl      = float(p.get("unrealized_pl", 0))
+        pl_sign = "+" if pl >= 0 else ""
+        print(f"    {sym:<6}  {qty} shares @ ${cost:.2f}"
+              f"  | Market value: ${mval:,.2f}  | P&L: {pl_sign}${pl:.2f}")
+
+    ans = input("\n  Import these positions into MarketMind? (y/n): ").strip().lower()
+    if ans == "y":
+        holdings = state.setdefault("holdings", {})
+        for p in positions:
+            sym  = p.get("symbol", "")
+            qty  = float(p.get("qty", 0))
+            cost = float(p.get("avg_buy_price", 0))
+            if sym and qty > 0:
+                holdings[sym] = {
+                    "shares":        qty,
+                    "avg_buy_price": cost,
+                    "source":        broker_tag,
+                    "import_date":   date.today().isoformat(),
+                }
+        cash   = float(p.get("cash", state.get("cash_available", 0)))
+        equity = sum(float(p.get("market_value", 0)) for p in positions) + cash
+        state["cash_available"]        = cash
+        state["total_portfolio_value"] = equity
+        print(f"  ✓ {len(positions)} position(s) imported.")
+    return state
+
+
+# ── Alpaca ────────────────────────────────────────────────────────────────────
+
+def _connect_alpaca(state: dict) -> dict:
+    """
+    Connects to Alpaca (paper or live) using API key + secret.
+    Official API — no extra dependencies beyond stdlib urllib.
+    """
+    print("\n  ── Alpaca ──────────────────────────────────────────────────")
+    print("  Official API  |  Free paper + live trading  |  No credit card")
+    print("  Credentials: API Key ID + Secret Key (not your login password)")
+    print("  Security: Keys are read-only by default. MarketMind cannot")
+    print("            place orders without your explicit action.\n")
+
+    print("  Account type:")
+    print("  1. Paper  — Simulated money, zero real risk. Best for getting started.")
+    print("  2. Live   — Real money. Only if your Alpaca account is funded.\n")
+    while True:
+        c = input("  Enter 1 or 2: ").strip()
+        if c == "1":
+            base_url, acct_type = ALPACA_PAPER_URL, "paper"
+            break
+        elif c == "2":
+            base_url, acct_type = ALPACA_LIVE_URL, "live"
+            print("  ⚠  Live selected — no orders placed automatically.")
+            break
+        print("  Please enter 1 or 2.")
+
+    print("\n  Get your free keys (≈1 min):")
+    print("  1. Sign up at https://alpaca.markets")
+    if acct_type == "paper":
+        print("  2. Dashboard → Paper Trading → API Keys → Generate New Key")
+    else:
+        print("  2. Dashboard → Live Trading → API Keys → Generate New Key")
+    print("  3. Copy the Key ID and Secret (secret shown only once)\n")
+
+    api_key    = input("  API Key ID : ").strip()
+    api_secret = input("  Secret Key : ").strip()
+    if not api_key or not api_secret:
+        print("  No credentials entered — skipped.")
+        return state
+
+    print("\n  Testing connection...", end=" ", flush=True)
+    url = f"{base_url}/v2/account"
+    req = urllib.request.Request(url, headers={
+        "APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            account = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print("FAILED")
+        print(f"  ✗ HTTP {e.code}: {e.read().decode()}")
+        return state
+    except Exception as e:
+        print("FAILED")
+        print(f"  ✗ {e}")
+        return state
+
+    equity = float(account.get("equity", 0))
+    cash   = float(account.get("cash",   0))
+    print("OK")
+    print(f"  ✓ Connected  |  Status: {account.get('status','?').upper()}"
+          f"  |  Equity: ${equity:,.2f}  |  Cash: ${cash:,.2f}")
+
+    _save_env_keys(
+        {"ALPACA_API_KEY": api_key, "ALPACA_API_SECRET": api_secret,
+         "ALPACA_BASE_URL": base_url},
+        "# Alpaca brokerage — https://alpaca.markets"
+    )
+    print("  ✓ Credentials saved to .env (local only).")
+
+    state.update({"broker": "alpaca", "broker_url": base_url,
+                  "broker_acct_type": acct_type})
+
+    # Fetch and offer to import positions
+    try:
+        pos_req = urllib.request.Request(
+            f"{base_url}/v2/positions",
+            headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret,
+                     "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(pos_req, timeout=10) as r:
+            raw = json.loads(r.read().decode())
+        positions = [
+            {"symbol": p["symbol"], "qty": p["qty"],
+             "avg_buy_price": p["avg_entry_price"],
+             "market_value": p["market_value"],
+             "unrealized_pl": p["unrealized_pl"],
+             "cash": cash}
+            for p in raw
+        ]
+    except Exception:
+        positions = []
+
+    return _import_positions(state, positions, "alpaca_import")
+
+
+# ── Robinhood ─────────────────────────────────────────────────────────────────
+
+def _connect_robinhood(state: dict) -> dict:
+    """
+    Connects to Robinhood via the robin_stocks library (unofficial API).
+    Uses username + password + MFA code — no API key exists for Robinhood.
+    """
+    print("\n  ── Robinhood ────────────────────────────────────────────────")
+    print("  ⚠  IMPORTANT: Robinhood has NO official API for third-party")
+    print("     apps. This connection uses 'robin_stocks', an unofficial")
+    print("     library that reverse-engineers Robinhood's mobile app.")
+    print()
+    print("     What this means for you:")
+    print("     • It uses your Robinhood username & password (not an API key)")
+    print("     • It may break if Robinhood updates their app without notice")
+    print("     • Robinhood's Terms of Service technically prohibit this")
+    print("     • MarketMind reads your positions only — it cannot place trades")
+    print()
+    print("  If you prefer a safer, officially supported connection,")
+    print("  go back and choose Alpaca (free, takes 1 minute to set up).\n")
+
+    ans = input("  Understood — continue with Robinhood? (y/n): ").strip().lower()
+    if ans != "y":
+        print("  Robinhood connection cancelled.")
+        return state
+
+    # Check dependency
+    try:
+        import robin_stocks.robinhood as rh
+    except ImportError:
+        print("\n  robin_stocks is not installed. Run:")
+        print("    pip install robin_stocks")
+        print("  Then re-run MarketMind to connect your Robinhood account.")
+        return state
+
+    print("\n  Enter your Robinhood login credentials.")
+    print("  These are stored only in memory during this session —")
+    print("  they are NOT written to .env or any file.\n")
+
+    import getpass
+    username = input("  Robinhood email: ").strip()
+    password = getpass.getpass("  Password (hidden): ")
+
+    print("\n  Logging in...", end=" ", flush=True)
+    try:
+        login = rh.login(username, password, store_session=False)
+        if not login:
+            print("FAILED")
+            print("  ✗ Login failed. Check your credentials and try again.")
+            return state
+    except Exception as e:
+        print("FAILED")
+        print(f"  ✗ {e}")
+        return state
+
+    print("OK")
+
+    # Fetch account info
+    try:
+        profile  = rh.load_account_profile()
+        cash     = float(profile.get("cash", 0) or 0)
+        equity   = float(profile.get("equity", 0) or 0)
+        print(f"  ✓ Connected to Robinhood")
+        print(f"    Equity: ${equity:,.2f}  |  Cash: ${cash:,.2f}")
+    except Exception:
+        cash, equity = 0.0, 0.0
+        print("  ✓ Logged in (could not fetch account summary)")
+
+    state.update({"broker": "robinhood"})
+
+    # Note: Robinhood credentials are intentionally NOT saved to .env
+    # (passwords should never be stored in plain text files)
+    print("\n  Note: Robinhood credentials are not saved to disk for security.")
+    print("  You will be asked to log in again on the next session.")
+
+    # Fetch and offer to import positions
+    try:
+        raw = rh.get_open_stock_positions()
+        positions = []
+        for p in raw:
+            instrument_url = p.get("instrument", "")
+            # Resolve ticker symbol from instrument URL
+            try:
+                inst_req = urllib.request.Request(
+                    instrument_url,
+                    headers={"Accept": "application/json"}
+                )
+                with urllib.request.urlopen(inst_req, timeout=5) as r:
+                    inst = json.loads(r.read().decode())
+                symbol = inst.get("symbol", "")
+            except Exception:
+                symbol = ""
+
+            qty  = float(p.get("quantity", 0) or 0)
+            cost = float(p.get("average_buy_price", 0) or 0)
+
+            if symbol and qty > 0:
+                # Get current price for market value estimate
+                try:
+                    quote = rh.get_latest_price(symbol)
+                    price = float(quote[0]) if quote else cost
+                except Exception:
+                    price = cost
+                mval = round(qty * price, 2)
+                pl   = round(mval - qty * cost, 2)
+                positions.append({
+                    "symbol": symbol, "qty": qty,
+                    "avg_buy_price": cost,
+                    "market_value": mval,
+                    "unrealized_pl": pl,
+                    "cash": cash,
+                })
+    except Exception:
+        positions = []
+
+    try:
+        rh.logout()
+    except Exception:
+        pass
+
+    return _import_positions(state, positions, "robinhood_import")
+
+
+# ── Interactive Brokers ───────────────────────────────────────────────────────
+
+def _connect_ibkr(state: dict) -> dict:
+    """
+    Connects to Interactive Brokers via ib_insync (official API).
+    Requires TWS or IB Gateway to be running on the local machine.
+    """
+    print("\n  ── Interactive Brokers ─────────────────────────────────────")
+    print("  Official API  |  Extremely powerful  |  Free for account holders")
+    print()
+    print("  Requirements before connecting:")
+    print("  1. An Interactive Brokers account (min. $0 for IBKR Lite)")
+    print("  2. Trader Workstation (TWS) or IB Gateway installed and running")
+    print("     Download: https://www.interactivebrokers.com/en/trading/tws.php")
+    print("  3. In TWS: Edit → Global Configuration → API → Settings")
+    print("     ✓ Enable ActiveX and Socket Clients")
+    print("     ✓ Socket port: 7497 (paper) or 7496 (live)")
+    print("     ✓ Allow connections from localhost only\n")
+
+    ans = input("  Is TWS or IB Gateway running right now? (y/n): ").strip().lower()
+    if ans != "y":
+        print("  Please start TWS first, then re-run this setup.")
+        return state
+
+    # Check dependency
+    try:
+        from ib_insync import IB, util
+        util.startLoop()
+    except ImportError:
+        print("\n  ib_insync is not installed. Run:")
+        print("    pip install ib_insync")
+        print("  Then re-run MarketMind to connect your IBKR account.")
+        return state
+
+    print("\n  Account type:")
+    print("  1. Paper  — TWS paper trading (port 7497)")
+    print("  2. Live   — TWS live trading   (port 7496)\n")
+    while True:
+        c = input("  Enter 1 or 2: ").strip()
+        if c == "1":
+            port, acct_type = 7497, "paper"
+            break
+        elif c == "2":
+            port, acct_type = 7496, "live"
+            print("  ⚠  Live selected — no orders placed automatically.")
+            break
+        print("  Please enter 1 or 2.")
+
+    print(f"\n  Connecting to TWS on port {port}...", end=" ", flush=True)
+    ib = IB()
+    try:
+        ib.connect("127.0.0.1", port, clientId=10)
+    except Exception as e:
+        print("FAILED")
+        print(f"  ✗ Could not connect: {e}")
+        print("  Ensure TWS is running and API connections are enabled.")
+        return state
+
+    print("OK")
+
+    # Account summary
+    try:
+        summary = {s.tag: s.value for s in ib.accountSummary()}
+        equity  = float(summary.get("NetLiquidation", 0))
+        cash    = float(summary.get("TotalCashValue",  0))
+        acct_id = summary.get("AccountId", "unknown")
+        print(f"  ✓ Connected to IBKR  |  Account: {acct_id}"
+              f"  |  Equity: ${equity:,.2f}  |  Cash: ${cash:,.2f}")
+    except Exception:
+        equity, cash, acct_id = 0.0, 0.0, "unknown"
+        print("  ✓ Connected (could not fetch account summary)")
+
+    _save_env_keys(
+        {"IBKR_PORT": str(port), "IBKR_ACCT_TYPE": acct_type},
+        "# Interactive Brokers — requires TWS or IB Gateway running locally"
+    )
+    print("  ✓ Port and account type saved to .env.")
+
+    state.update({"broker": "ibkr", "broker_port": port,
+                  "broker_acct_type": acct_type})
+
+    # Fetch and offer to import positions
+    try:
+        from ib_insync import Stock
+        raw = ib.positions()
+        positions = []
+        for p in raw:
+            symbol = p.contract.symbol
+            qty    = float(p.position)
+            cost   = float(p.avgCost) / qty if qty else 0
+            ticker = ib.reqMktData(p.contract, "", True, False)
+            ib.sleep(1)
+            price  = ticker.last or ticker.close or cost
+            mval   = round(qty * price, 2)
+            pl     = round(mval - qty * cost, 2)
+            positions.append({
+                "symbol": symbol, "qty": qty,
+                "avg_buy_price": round(cost, 4),
+                "market_value": mval,
+                "unrealized_pl": pl,
+                "cash": cash,
+            })
+    except Exception:
+        positions = []
+
+    ib.disconnect()
+    return _import_positions(state, positions, "ibkr_import")
+
+
+# ── Broker menu ───────────────────────────────────────────────────────────────
+
+def _ask_broker_connection(state: dict) -> dict:
+    """
+    Shows a broker selection menu and routes to the chosen broker's
+    connection flow. All broker flows write credentials to .env (except
+    Robinhood, which never stores a password). Returns updated state.
+    """
+    print("\n┌─ CONNECT YOUR BROKERAGE ACCOUNT (optional) ─────────────────┐")
+    print("│ Link MarketMind to your real brokerage so your Daily Trade  │")
+    print("│ Scan reflects what you actually own.                        │")
+    print("│                                                             │")
+    print("│ Security: Credentials are stored only in your local .env   │")
+    print("│ file and never uploaded or shared. MarketMind reads your   │")
+    print("│ positions — it cannot place or cancel orders for you.      │")
+    print("└─────────────────────────────────────────────────────────────┘")
+
+    ans = input("\nWould you like to connect a brokerage account? (y/n): ").strip().lower()
+    if ans != "y":
+        print("  Skipped. You can connect a broker later by re-running setup.")
+        return state
+
+    print("\n  Choose your broker:\n")
+    print("  1. Alpaca          — Official API. Free paper + live trading.")
+    print("                       Best choice if you don't have a broker yet.")
+    print("                       Needs: API Key ID + Secret Key\n")
+    print("  2. Robinhood       — Unofficial (no public API exists).")
+    print("                       Works today but may break with app updates.")
+    print("                       Needs: Robinhood username + password\n")
+    print("  3. Interactive     — Official API. Very powerful, all asset classes.")
+    print("     Brokers (IBKR)    Needs: TWS desktop app running + ib_insync\n")
+    print("  4. Skip for now    — Set up a connection later.\n")
+
+    handlers = {"1": _connect_alpaca, "2": _connect_robinhood, "3": _connect_ibkr}
+    while True:
+        c = input("  Enter 1, 2, 3, or 4: ").strip()
+        if c in handlers:
+            return handlers[c](state)
+        if c == "4":
+            print("  Skipped. Run setup again any time to connect a broker.")
+            return state
+        print("  Please enter 1, 2, 3, or 4.")
+
+
+def _ask_profile_name() -> str:
+    """
+    Asks the user to give their profile a name.
+    Returns the name as a string.
+    """
+    print("\n┌─ PROFILE NAME ──────────────────────────────────────────────┐")
+    print("│ Give your trading profile a name so you can identify it     │")
+    print("│ later. This is just a label — it doesn't affect any trades. │")
+    print("│ Examples: 'My First Portfolio', 'Divya - Growth Fund'       │")
+    print("└─────────────────────────────────────────────────────────────┘")
+    while True:
+        name = input("Profile name: ").strip()
+        if name:
+            print(f"  ✓ Profile name set to: \"{name}\"")
+            return name
+        print("  Please enter a name for your profile.")
+
+
 def _ask_risk_appetite() -> str:
     """
     Interactively asks the user for their risk appetite and returns
     one of: "conservative", "moderate", "aggressive".
+    Also previews the take-profit and stop-loss percentages each option sets.
     """
-    print("\nBefore we begin, let's understand your risk appetite.")
-    print("This tells MarketMind how aggressively to invest your money.\n")
-    print("  1. Conservative  — Safety first. Prefer stable, dividend-paying stocks.")
-    print("                     Lower potential returns, but much lower chance of big losses.")
-    print("                     Good for: people who cannot afford to lose money.\n")
-    print("  2. Moderate      — Balanced approach. Mix of stable and growth stocks.")
-    print("                     Medium risk for medium returns.")
-    print("                     Good for: most beginners who want steady growth.\n")
-    print("  3. Aggressive    — Growth-focused. Higher-volatility stocks with big upside.")
-    print("                     Higher potential returns, but bigger swings up and down.")
-    print("                     Good for: people comfortable with short-term losses for long-term gain.\n")
+    print("\n┌─ RISK APPETITE ─────────────────────────────────────────────┐")
+    print("│ Your risk appetite tells MarketMind how aggressively to     │")
+    print("│ trade. It sets two key limits automatically:                │")
+    print("│                                                             │")
+    print("│  • Take-profit %  — When a trade gains this %, MarketMind  │")
+    print("│                     tells you to sell and lock in profits.  │")
+    print("│  • Stop-loss %    — When a trade loses this %, MarketMind  │")
+    print("│                     tells you to exit to protect capital.   │")
+    print("└─────────────────────────────────────────────────────────────┘\n")
+    print("  1. Conservative  — Safety first. Stable, dividend-paying stocks.")
+    print("                     Take-profit: +3%  |  Stop-loss: -1.5%")
+    print("                     Best for: beginners or anyone who cannot afford big losses.\n")
+    print("  2. Moderate      — Balanced. Mix of stable and growth stocks.")
+    print("                     Take-profit: +5%  |  Stop-loss: -2%")
+    print("                     Best for: most investors wanting steady, moderate growth.\n")
+    print("  3. Aggressive    — Growth-focused. High-volatility momentum stocks.")
+    print("                     Take-profit: +8%  |  Stop-loss: -3%")
+    print("                     Best for: experienced traders comfortable with bigger swings.\n")
 
     options = {"1": "conservative", "2": "moderate", "3": "aggressive",
                "conservative": "conservative", "moderate": "moderate", "aggressive": "aggressive"}
@@ -2741,9 +3461,9 @@ def _ask_risk_appetite() -> str:
         choice = input("Enter your choice (1, 2, or 3): ").strip().lower()
         if choice in options:
             selected = options[choice]
-            print(f"\nRisk appetite set to: {selected.upper()}")
+            print(f"\n  ✓ Risk appetite set to: {selected.upper()}")
             return selected
-        print("Please enter 1, 2, or 3.")
+        print("  Please enter 1, 2, or 3.")
 
 
 def _ask_initial_investment() -> float:
@@ -2751,20 +3471,59 @@ def _ask_initial_investment() -> float:
     Asks the user how much money they want to start with.
     Returns the amount as a float.
     """
-    print("\nHow much money would you like to start with? (in USD)")
-    print("This is your initial investment. No new money will be added for 6 months.")
-    print("Example: 1000, 5000, 10000\n")
+    print("\n┌─ STARTING BUDGET ───────────────────────────────────────────┐")
+    print("│ This is the total amount of money you want MarketMind to    │")
+    print("│ manage. Think of it as your trading 'pot'.                  │")
+    print("│                                                             │")
+    print("│  • No new money is added for 6 months after setup.         │")
+    print("│  • Profits from trades are reinvested automatically        │")
+    print("│    (compounding), so your pot can grow over time.          │")
+    print("│  • Only invest what you can afford to lose entirely.       │")
+    print("│                                                             │")
+    print("│ Examples: 1000 (starter), 5000 (typical), 10000 (advanced) │")
+    print("└─────────────────────────────────────────────────────────────┘")
     while True:
         raw = input("Enter amount (USD): ").strip().replace(",", "").replace("$", "")
         try:
             amount = float(raw)
             if amount < 100:
-                print("Minimum investment is $100. Please enter a higher amount.")
+                print("  Minimum budget is $100. Please enter a higher amount.")
                 continue
-            print(f"\nInitial investment set to: ${amount:,.2f}")
+            print(f"\n  ✓ Starting budget set to: ${amount:,.2f}")
             return amount
         except ValueError:
-            print("Please enter a valid number, e.g. 5000")
+            print("  Please enter a valid number, e.g. 5000")
+
+
+def _print_profile_summary(profile_name: str, capital: float, risk_level: str,
+                            take_profit: float, stop_loss: float,
+                            start_date: str, end_date: str) -> None:
+    """
+    Prints a clear summary of every profile field with a brief definition,
+    so the user understands exactly what has been set up.
+    """
+    print("\n" + "=" * 62)
+    print("  YOUR TRADING PROFILE — SUMMARY")
+    print("=" * 62)
+    print(f"  Profile Name      : {profile_name}")
+    print(f"    └─ Your label for this account.\n")
+    print(f"  Starting Budget   : ${capital:,.2f}")
+    print(f"    └─ Total money MarketMind will trade with.\n")
+    print(f"  Risk Appetite     : {risk_level.upper()}")
+    print(f"    └─ How aggressively to trade (Conservative / Moderate / Aggressive).\n")
+    print(f"  Take-Profit       : +{take_profit}%")
+    print(f"    └─ Exit a winning trade when it gains this % to lock in profits.\n")
+    print(f"  Stop-Loss         : -{stop_loss}%")
+    print(f"    └─ Exit a losing trade when it drops this % to protect your capital.\n")
+    print(f"  Max Open Trades   : 5")
+    print(f"    └─ Never hold more than 5 trades at the same time (keeps you focused).\n")
+    print(f"  Max Per Trade     : 20% of total capital")
+    print(f"    └─ No single trade can use more than 20% of your budget.\n")
+    print(f"  Risk Per Trade    : 2% of total capital")
+    print(f"    └─ The most you can lose on any one trade (used to size positions).\n")
+    print(f"  Trading Period    : {start_date}  →  {end_date}")
+    print(f"    └─ Your 6-month window. Results are tracked over this period.\n")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
@@ -2776,9 +3535,13 @@ if __name__ == "__main__":
     # First run: ask questions and initialise trading account
     if not os.path.exists(PORTFOLIO_STATE_FILE):
         print("\nLooks like this is your first time running MarketMind.")
-        print("Let's set up your trading account.\n")
+        print("Let's set up your trading profile. We'll walk through each")
+        print("setting one at a time and explain what it means.\n")
 
-        # Ask for starting capital
+        # Ask for profile name
+        profile_name = _ask_profile_name()
+
+        # Ask for starting capital (budget)
         initial_investment = _ask_initial_investment()
         TRADING_CONFIG["starting_capital"]    = initial_investment
         TRADING_CONFIG["initial_investment"]  = initial_investment
@@ -2788,16 +3551,32 @@ if __name__ == "__main__":
         TRADING_CONFIG["risk_level"] = risk_level
 
         # Set take-profit / stop-loss based on risk level
-        take_profit = {"conservative": 3.0, "moderate": 5.0, "aggressive": 8.0}
-        stop_loss   = {"conservative": 1.5, "moderate": 2.0, "aggressive": 3.0}
-        TRADING_CONFIG["take_profit_pct"] = take_profit[risk_level]
-        TRADING_CONFIG["stop_loss_pct"]   = stop_loss[risk_level]
-        print(f"Take-profit target: +{take_profit[risk_level]}%  |  Stop-loss: -{stop_loss[risk_level]}%")
+        take_profit_map = {"conservative": 3.0, "moderate": 5.0, "aggressive": 8.0}
+        stop_loss_map   = {"conservative": 1.5, "moderate": 2.0, "aggressive": 3.0}
+        TRADING_CONFIG["take_profit_pct"] = take_profit_map[risk_level]
+        TRADING_CONFIG["stop_loss_pct"]   = stop_loss_map[risk_level]
 
-        print(f"\nSetting up your trading account...")
+        print(f"\nCreating your trading account...")
         state = initialize_portfolio()
-        print(f"Trading account created. Period: {state['start_date']} to {state['end_date']}")
-        print(f"portfolio_state.json saved.\n")
+        state["profile_name"] = profile_name
+        _save_state(state)
+
+        # Print a clear summary of every setting with its definition
+        _print_profile_summary(
+            profile_name   = profile_name,
+            capital        = initial_investment,
+            risk_level     = risk_level,
+            take_profit    = take_profit_map[risk_level],
+            stop_loss      = stop_loss_map[risk_level],
+            start_date     = state["start_date"],
+            end_date       = state["end_date"],
+        )
+
+        # Offer optional brokerage connection
+        state = _ask_broker_connection(state)
+        _save_state(state)
+
+        print(f"\n  ✓ Profile saved to portfolio_state.json\n")
 
     else:
         # Returning user — ask if they want to update their risk appetite

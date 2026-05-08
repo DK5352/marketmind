@@ -34,6 +34,9 @@ except Exception:
     pass
 
 import marketmind as mm
+from marketmind import ALPACA_PAPER_URL, ALPACA_LIVE_URL
+from pre_market import fetch_gap_info, apply_gap_filter, GapRisk, GapType, premarket_snapshot
+from prebell import compute_signal
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -53,8 +56,22 @@ def profile_path(name: str) -> str:
 
 
 def list_profiles() -> list[str]:
+    """
+    Returns profile names sorted alphabetically.
+    Reads the display name from inside the JSON (profile_name field) to
+    preserve original casing (e.g. 'DK' stays 'DK', not 'Dk').
+    Falls back to the filename if the field is missing.
+    """
     files = [f for f in os.listdir(PROFILES_DIR) if f.startswith("portfolio_") and f.endswith(".json")]
-    return [f.replace("portfolio_", "").replace(".json", "").capitalize() for f in sorted(files)]
+    names = []
+    for f in sorted(files):
+        try:
+            with open(os.path.join(PROFILES_DIR, f)) as fh:
+                data = json.load(fh)
+            names.append(data.get("profile_name") or f.replace("portfolio_", "").replace(".json", "").capitalize())
+        except Exception:
+            names.append(f.replace("portfolio_", "").replace(".json", "").capitalize())
+    return names
 
 
 def load_profile(name: str) -> dict:
@@ -70,9 +87,13 @@ def save_profile(name: str, state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def create_profile(name: str, capital: float, risk_level: str, tax_bracket_pct: float = 22.0) -> dict:
+def create_profile(name: str, capital: float, risk_level: str,
+                   tax_bracket_pct: float = 22.0, trading_persona: str = "swing") -> dict:
     tp = {"conservative": 3.0, "moderate": 5.0, "aggressive": 8.0}[risk_level]
     sl = {"conservative": 1.5, "moderate": 2.0, "aggressive": 3.0}[risk_level]
+
+    # Persona overrides take-profit / stop-loss / max hold
+    persona_cfg = mm.PERSONA_CONFIGS.get(trading_persona, mm.PERSONA_CONFIGS["swing"])
     state = {
         "profile_name":          name,
         "initial_investment":    capital,
@@ -82,8 +103,12 @@ def create_profile(name: str, capital: float, risk_level: str, tax_bracket_pct: 
         "end_date":              (date.today().replace(year=date.today().year + 1)).isoformat(),
         "risk_level":            risk_level,
         "tax_bracket_pct":       tax_bracket_pct,
-        "take_profit_pct":       tp,
-        "stop_loss_pct":         sl,
+        "trading_persona":       trading_persona,
+        "persona_label":         persona_cfg["label"],
+        "take_profit_pct":       persona_cfg["take_profit_pct"],
+        "stop_loss_pct":         persona_cfg["stop_loss_pct"],
+        "max_hold_days":         persona_cfg["max_hold_days"],
+        "max_open_trades":       persona_cfg["max_open_trades"],
         "holdings":              {},
         "transaction_history":   [],
         "realized_gains":        0.0,
@@ -374,20 +399,92 @@ st.sidebar.subheader("👤 Profile")
 existing = list_profiles()
 
 with st.sidebar.expander("＋ Create new profile"):
-    new_name    = st.text_input("Profile name", placeholder="e.g. Hakapi")
-    new_capital = st.number_input("Starting capital ($)", value=10000, step=500, min_value=100)
-    new_risk    = st.selectbox("Risk level", ["moderate", "conservative", "aggressive"], key="new_risk")
-    new_tax     = st.selectbox(
-        "Tax bracket (marginal rate)",
+    new_name = st.text_input(
+        "Profile name",
+        placeholder="e.g. My Growth Fund",
+        help="A label for this trading account. You can have multiple profiles (e.g. one conservative, one aggressive). Doesn't affect any trades.",
+    )
+    new_capital = st.number_input(
+        "Starting budget ($)",
+        value=10000, step=500, min_value=100,
+        help="The total amount of money MarketMind will manage. Think of it as your trading 'pot'.\n\n"
+             "• No new money is added for 6 months after setup.\n"
+             "• Profits from trades are reinvested automatically (compounding).\n"
+             "• Only invest what you can afford to lose entirely.",
+    )
+    new_persona = st.selectbox(
+        "Trading persona",
+        ["swing", "day", "longterm"],
+        format_func=lambda x: {
+            "day":      "⚡ Day Trading — same-day exits, +1.5% target",
+            "swing":    "🔄 Swing Trading — 2–5 day holds, +5% target",
+            "longterm": "📈 Long-term Investing — 3–12 month holds, +25% target",
+        }[x],
+        key="new_persona",
+        help="Your trading style — this is the most important setting.\n\n"
+             "⚡ Day Trading: Buy and sell within the same day. Very tight stop-loss (0.75%). "
+             "Focuses on volume spikes and momentum. High frequency, small gains.\n\n"
+             "🔄 Swing Trading: Hold for 2–5 days. Capture short-term price moves of 3–8%. "
+             "Uses RSI, MACD, and Bollinger Band signals.\n\n"
+             "📈 Long-term Investing: Hold for months. Focuses on fundamentals — P/E ratio, "
+             "analyst ratings, profit margins. Wide stop-loss (8%) to ride out volatility.",
+    )
+
+    # Show what the persona sets
+    _pcfg = mm.PERSONA_CONFIGS[new_persona]
+    st.caption(
+        f"{_pcfg['emoji']} **{_pcfg['label']}** — {_pcfg['description']}  \n"
+        f"Take-profit: **+{_pcfg['take_profit_pct']}%**  |  "
+        f"Stop-loss: **−{_pcfg['stop_loss_pct']}%**  |  "
+        f"Max hold: **{_pcfg['hold_label']}**  |  "
+        f"Max trades: **{_pcfg['max_open_trades']}**"
+    )
+
+    new_risk = st.selectbox(
+        "Risk appetite",
+        ["moderate", "conservative", "aggressive"],
+        key="new_risk",
+        help="Controls how aggressively MarketMind trades.\n\n"
+             "• Conservative — stable stocks, tight stop-loss (-1.5%), take-profit at +3%\n"
+             "• Moderate — balanced mix, stop-loss -2%, take-profit +5%\n"
+             "• Aggressive — high-volatility momentum stocks, stop-loss -3%, take-profit +8%",
+    )
+    new_tax = st.selectbox(
+        "Federal tax bracket",
         [10, 12, 22, 24, 32, 35, 37],
         index=2,
         key="new_tax",
-        help="Your federal income tax bracket — used to estimate capital gains tax on recommendations.",
+        help="Your marginal federal income tax rate.\n\n"
+             "Used to estimate capital gains tax on trade recommendations.\n"
+             "• Short-term gains (held < 1 year) are taxed at this rate.\n"
+             "• Long-term gains (held ≥ 1 year) are taxed at 0%, 15%, or 20%.\n\n"
+             "Not sure? Most people are in the 22% or 24% bracket.",
     )
+
+    # Risk level summary so user sees what they're choosing
+    _tp = {"conservative": 3.0, "moderate": 5.0, "aggressive": 8.0}[new_risk]
+    _sl = {"conservative": 1.5, "moderate": 2.0, "aggressive": 3.0}[new_risk]
+    st.caption(f"Take-profit: **+{_tp}%**  |  Stop-loss: **−{_sl}%**  |  Max 5 open trades  |  Max 20% per trade")
+
     if st.button("Create profile"):
         if new_name.strip():
-            create_profile(new_name.strip().capitalize(), float(new_capital), new_risk, float(new_tax))
-            st.success(f"Profile '{new_name.capitalize()}' created!")
+            _name    = new_name.strip()
+            _state   = create_profile(_name, float(new_capital), new_risk, float(new_tax), new_persona)
+            _pcfg    = mm.PERSONA_CONFIGS[new_persona]
+            _lt_rate = "0%" if new_tax <= 12 else ("15%" if new_tax <= 35 else "20%")
+            st.success(f"✓ Profile **{_name}** created!")
+            st.info(
+                f"**Your profile at a glance:**\n\n"
+                f"- **Persona:** {_pcfg['emoji']} {_pcfg['label']} — {_pcfg['tagline']}  \n"
+                f"- **Budget:** ${float(new_capital):,.0f}  \n"
+                f"- **Risk:** {new_risk.capitalize()}  \n"
+                f"- **Take-profit:** +{_pcfg['take_profit_pct']}%  |  "
+                f"**Stop-loss:** −{_pcfg['stop_loss_pct']}%  |  "
+                f"**Max hold:** {_pcfg['hold_label']}  \n"
+                f"- **Tax bracket:** {new_tax}% short-term / {_lt_rate} long-term  \n"
+                f"- **Period:** {_state['start_date']} → {_state['end_date']}"
+            )
+            st.session_state["active_profile"] = _name
             st.rerun()
         else:
             st.warning("Enter a profile name.")
@@ -396,33 +493,69 @@ if not existing:
     st.sidebar.warning("No profiles yet. Create one above.")
     st.stop()
 
-active_profile = st.sidebar.selectbox("Active profile", existing)
+# Default to last-created profile (or session state), else first in list
+_default_profile = st.session_state.get("active_profile", existing[0])
+_default_index   = existing.index(_default_profile) if _default_profile in existing else 0
+active_profile   = st.sidebar.selectbox("Active profile", existing, index=_default_index)
 profile_state  = load_profile(active_profile)
 
-# Sync mm config from profile
+# Point the agent at this profile's state file
 mm.PORTFOLIO_STATE_FILE = profile_path(active_profile)
-mm.TRADING_CONFIG["starting_capital"]  = profile_state.get("initial_investment", 10000)
-mm.TRADING_CONFIG["risk_level"]        = profile_state.get("risk_level", "moderate")
-mm.TRADING_CONFIG["take_profit_pct"]   = profile_state.get("take_profit_pct", 5.0)
-mm.TRADING_STATE_FILE = profile_path(active_profile)
-
-tp = profile_state.get("take_profit_pct", 5.0)
-sl = profile_state.get("stop_loss_pct",   2.0)
-mm.TRADING_CONFIG["take_profit_pct"] = tp
-mm.TRADING_CONFIG["stop_loss_pct"]   = sl
 
 st.sidebar.markdown("---")
+
+# ── Persona switcher ──────────────────────────────────────────────────────────
+# Users can switch personas within the same profile at any time.
+# The change is saved back to portfolio_state.json immediately.
+_persona_options = ["day", "swing", "longterm"]
+_persona_labels  = {
+    "day":      "⚡ Day Trading",
+    "swing":    "🔄 Swing Trading",
+    "longterm": "📈 Long-term Investing",
+}
+_current_persona = profile_state.get("trading_persona", "swing")
+_persona_index   = _persona_options.index(_current_persona) if _current_persona in _persona_options else 1
+
+_selected_persona = st.sidebar.selectbox(
+    "Trading persona",
+    _persona_options,
+    index=_persona_index,
+    format_func=lambda x: _persona_labels[x],
+    key=f"persona_switcher_{active_profile}",
+)
+
+# If persona changed, save it to the profile immediately
+if _selected_persona != _current_persona:
+    _new_pcfg = mm.PERSONA_CONFIGS[_selected_persona]
+    profile_state["trading_persona"]   = _selected_persona
+    profile_state["persona_label"]     = _new_pcfg["label"]
+    profile_state["take_profit_pct"]   = _new_pcfg["take_profit_pct"]
+    profile_state["stop_loss_pct"]     = _new_pcfg["stop_loss_pct"]
+    profile_state["max_hold_days"]     = _new_pcfg["max_hold_days"]
+    profile_state["max_open_trades"]   = _new_pcfg["max_open_trades"]
+    save_profile(active_profile, profile_state)
+    st.rerun()
+
+# Apply the active persona to TRADING_CONFIG
+mm.apply_persona(_selected_persona)
+mm.TRADING_CONFIG["risk_level"]       = profile_state.get("risk_level", "moderate")
+mm.TRADING_CONFIG["starting_capital"] = profile_state.get("initial_investment", 10000)
+_persona_key = _selected_persona   # short alias used throughout the page
+
+_active_pcfg = mm.PERSONA_CONFIGS[_selected_persona]
+tp = profile_state.get("take_profit_pct", _active_pcfg["take_profit_pct"])
+sl = profile_state.get("stop_loss_pct",   _active_pcfg["stop_loss_pct"])
+
 tax_bracket = profile_state.get("tax_bracket_pct", 22.0)
-st.sidebar.caption(f"**Risk:** {profile_state.get('risk_level','—').title()}")
-st.sidebar.caption(f"**Take-profit:** +{tp}%  |  **Stop-loss:** -{sl}%")
-st.sidebar.caption(f"**Tax bracket:** {int(tax_bracket)}%")
-st.sidebar.caption(f"**Robinhood data:** {'✅ Imported' if profile_state.get('robinhood_imported') else '⬜ Not imported'}")
+st.sidebar.caption(f"Take-profit **+{tp}%**  |  Stop-loss **−{sl}%**  |  Hold **{_active_pcfg['hold_label']}**")
+st.sidebar.caption(f"Risk: {profile_state.get('risk_level','—').title()}  |  Tax: {int(tax_bracket)}%")
+st.sidebar.caption(f"{'✅' if profile_state.get('robinhood_imported') else '⬜'} Robinhood data")
 
 # Mode nav
 st.sidebar.markdown("---")
 mode = st.sidebar.radio(
     "Mode",
-    ["Portfolio", "Daily Trade Scan", "Stock Forecast", "Top 10 Snapshot", "Backtest"],
+    ["Portfolio", "Daily Trade Scan", "Pre-Bell Scanner", "Ask MarketMind", "Tax Calculator", "Stock Forecast", "Top 10 Snapshot", "Backtest"],
 )
 
 st.sidebar.markdown("---")
@@ -434,10 +567,25 @@ st.sidebar.caption("⚠️ Educational purposes only. Not financial advice.")
 # ══════════════════════════════════════════════════════════════════════════════
 if mode == "Portfolio":
     st.title(f"💼 Portfolio — {active_profile}")
+    st.markdown(
+        f"**Your command centre.** This is where you see everything you currently own, "
+        f"how each position is performing, and whether you should hold or exit. "
+        f"You can also connect your brokerage account here so MarketMind reads your real positions automatically — "
+        f"no manual entry needed."
+    )
+    st.info(
+        f"**Active persona: {_active_pcfg['emoji']} {_active_pcfg['label']}** — {_active_pcfg['tagline']}  \n"
+        f"Exit signals use: take-profit **+{tp}%** and stop-loss **−{sl}%**. "
+        f"Positions held longer than **{_active_pcfg['hold_label']}** will be flagged for review."
+    )
 
     # ── Robinhood upload ──
     st.subheader("📥 Import Robinhood Data")
-    st.caption("Export from Robinhood → Account → Statements & History → Download CSV")
+    st.caption(
+        "Upload your Robinhood transaction history and MarketMind will rebuild your portfolio automatically — "
+        "all your stocks, how many shares, and what you paid. "
+        "Export it from: Robinhood app → Account → Statements & History → Download CSV"
+    )
 
     uploaded = st.file_uploader(
         "Upload your Robinhood account history (CSV or PDF)",
@@ -481,6 +629,171 @@ if mode == "Portfolio":
                 save_profile(active_profile, profile_state)
                 st.success("Data imported! Scroll down to see your portfolio.")
                 st.rerun()
+
+    # ── Live broker connection ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔗 Connect a Live Brokerage Account")
+    st.caption(
+        "Link your real brokerage so MarketMind can read your actual positions. "
+        "Credentials are stored only in your local `.env` file — never uploaded or shared. "
+        "MarketMind reads positions only; it cannot place or cancel orders."
+    )
+
+    broker_tab1, broker_tab2 = st.tabs(["Alpaca (recommended)", "Interactive Brokers (IBKR)"])
+
+    with broker_tab1:
+        st.markdown(
+            "**Alpaca** is a free, regulated US brokerage with an official API.  \n"
+            "You can connect a **paper** (simulated) account for testing, or a **live** account when ready.  \n"
+            "Get free keys in ~1 min: [alpaca.markets](https://alpaca.markets) → Dashboard → API Keys → Generate New Key"
+        )
+        alp_col1, alp_col2 = st.columns(2)
+        with alp_col1:
+            alp_key    = st.text_input("API Key ID",    type="password", key="alp_key",
+                                        help="Found in your Alpaca dashboard under API Keys. Starts with 'PK' for paper accounts.")
+            alp_secret = st.text_input("Secret Key",    type="password", key="alp_secret",
+                                        help="Shown only once when you generate the key. Store it safely.")
+        with alp_col2:
+            alp_type = st.radio("Account type", ["Paper (simulated)", "Live (real money)"], key="alp_type",
+                                 help="Paper = fake money, no real risk. Use this to test MarketMind first.")
+            if alp_type == "Live (real money)":
+                st.warning("⚠️ Live account selected. No trades are placed automatically.")
+
+        if st.button("Test & Connect Alpaca", key="btn_alpaca"):
+            if not alp_key or not alp_secret:
+                st.warning("Please enter both your API Key ID and Secret Key.")
+            else:
+                base_url = ALPACA_PAPER_URL if "Paper" in alp_type else ALPACA_LIVE_URL
+                with st.spinner("Testing connection..."):
+                    account = mm._test_alpaca_connection(alp_key, alp_secret, base_url)
+
+                if "error" in account:
+                    st.error(f"Connection failed: {account['error']}")
+                else:
+                    equity = float(account.get("equity", 0))
+                    cash   = float(account.get("cash",   0))
+                    st.success(
+                        f"✓ Connected to Alpaca ({alp_type})  |  "
+                        f"Status: {account.get('status','?').upper()}  |  "
+                        f"Equity: ${equity:,.2f}  |  Cash: ${cash:,.2f}"
+                    )
+                    mm._save_env_keys(
+                        {"ALPACA_API_KEY": alp_key, "ALPACA_API_SECRET": alp_secret, "ALPACA_BASE_URL": base_url},
+                        "# Alpaca brokerage — https://alpaca.markets"
+                    )
+                    profile_state.update({"broker": "alpaca", "broker_url": base_url,
+                                          "broker_acct_type": "paper" if "Paper" in alp_type else "live"})
+
+                    # Fetch positions
+                    positions = mm._fetch_alpaca_positions(alp_key, alp_secret, base_url)
+                    if positions:
+                        pos_rows = [{
+                            "Symbol": p.get("symbol"),
+                            "Qty": p.get("qty"),
+                            "Avg Entry": f"${float(p.get('avg_entry_price',0)):.2f}",
+                            "Market Value": f"${float(p.get('market_value',0)):,.2f}",
+                            "P&L": f"${float(p.get('unrealized_pl',0)):+,.2f}",
+                        } for p in positions]
+                        st.markdown(f"**{len(positions)} open position(s) in your Alpaca account:**")
+                        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+
+                        if st.button("Import these positions into MarketMind", key="btn_alpaca_import"):
+                            holdings = profile_state.setdefault("holdings", {})
+                            for p in positions:
+                                sym  = p.get("symbol", "")
+                                qty  = float(p.get("qty", 0))
+                                cost = float(p.get("avg_entry_price", 0))
+                                if sym and qty > 0:
+                                    holdings[sym] = {"shares": qty, "avg_buy_price": cost,
+                                                     "source": "alpaca_import",
+                                                     "import_date": date.today().isoformat()}
+                            profile_state["cash_available"]        = cash
+                            profile_state["total_portfolio_value"] = equity
+                            save_profile(active_profile, profile_state)
+                            st.success(f"✓ {len(positions)} position(s) imported. Scroll down to see your holdings.")
+                            st.rerun()
+                    else:
+                        save_profile(active_profile, profile_state)
+                        st.info("No open positions found in your Alpaca account.")
+
+    with broker_tab2:
+        st.markdown(
+            "**Interactive Brokers** is a powerful, official brokerage API supporting stocks, options, futures, and more.  \n"
+            "Requires **Trader Workstation (TWS)** or **IB Gateway** running on your computer.  \n"
+            "[Download TWS](https://www.interactivebrokers.com/en/trading/tws.php)  |  "
+            "In TWS: Edit → Global Configuration → API → Enable Socket → port **7497** (paper) or **7496** (live)"
+        )
+        ibkr_col1, ibkr_col2 = st.columns(2)
+        with ibkr_col1:
+            ibkr_type = st.radio("Account type", ["Paper (port 7497)", "Live (port 7496)"], key="ibkr_type",
+                                  help="Paper = TWS paper trading session. Live = real funded account.")
+        with ibkr_col2:
+            ibkr_port = 7497 if "7497" in ibkr_type else 7496
+            st.metric("TWS Port", ibkr_port)
+            if ibkr_port == 7496:
+                st.warning("⚠️ Live account selected. No trades are placed automatically.")
+
+        if st.button("Test & Connect IBKR", key="btn_ibkr"):
+            try:
+                from ib_insync import IB, util
+                util.startLoop()
+            except ImportError:
+                st.error("ib_insync is not installed. Run `pip install ib_insync` in your terminal, then restart the app.")
+                st.stop()
+
+            with st.spinner(f"Connecting to TWS on port {ibkr_port}..."):
+                ib = IB()
+                try:
+                    ib.connect("127.0.0.1", ibkr_port, clientId=10)
+                except Exception as e:
+                    st.error(f"Could not connect: {e}. Make sure TWS is running with API access enabled.")
+                    st.stop()
+
+            summary = {s.tag: s.value for s in ib.accountSummary()}
+            equity  = float(summary.get("NetLiquidation", 0))
+            cash    = float(summary.get("TotalCashValue",  0))
+            acct_id = summary.get("AccountId", "unknown")
+            st.success(
+                f"✓ Connected to IBKR  |  Account: {acct_id}  |  Equity: ${equity:,.2f}  |  Cash: ${cash:,.2f}"
+            )
+            mm._save_env_keys(
+                {"IBKR_PORT": str(ibkr_port), "IBKR_ACCT_TYPE": "paper" if ibkr_port == 7497 else "live"},
+                "# Interactive Brokers — requires TWS or IB Gateway running locally"
+            )
+            profile_state.update({"broker": "ibkr", "broker_port": ibkr_port})
+
+            try:
+                raw = ib.positions()
+                positions = []
+                for p in raw:
+                    sym  = p.contract.symbol
+                    qty  = float(p.position)
+                    cost = float(p.avgCost) / qty if qty else 0
+                    positions.append({"symbol": sym, "qty": qty, "avg_buy_price": round(cost, 4)})
+            except Exception:
+                positions = []
+
+            ib.disconnect()
+
+            if positions:
+                st.markdown(f"**{len(positions)} open position(s) in your IBKR account:**")
+                st.dataframe(pd.DataFrame(positions), use_container_width=True, hide_index=True)
+                if st.button("Import these positions into MarketMind", key="btn_ibkr_import"):
+                    holdings = profile_state.setdefault("holdings", {})
+                    for p in positions:
+                        if p["symbol"] and p["qty"] > 0:
+                            holdings[p["symbol"]] = {
+                                "shares": p["qty"], "avg_buy_price": p["avg_buy_price"],
+                                "source": "ibkr_import", "import_date": date.today().isoformat()
+                            }
+                    profile_state["cash_available"]        = cash
+                    profile_state["total_portfolio_value"] = equity
+                    save_profile(active_profile, profile_state)
+                    st.success(f"✓ {len(positions)} position(s) imported.")
+                    st.rerun()
+            else:
+                save_profile(active_profile, profile_state)
+                st.info("No open positions found in your IBKR account.")
 
     st.markdown("---")
 
@@ -572,7 +885,16 @@ if mode == "Portfolio":
         # ── Engine check on holdings ──
         st.markdown("---")
         st.subheader("🔎 Engine Check on Your Holdings")
-        st.caption("Hold or exit each position? Includes tax-aware notes.")
+        _eck_desc = {
+            "day":      "Checks each position using **intraday rules** — did it hit your +1.5% target or -0.75% stop? "
+                        "Day traders should not hold positions overnight unless intentional.",
+            "swing":    "Checks each stock you own using **technical indicators** (RSI, MACD) and your "
+                        "take-profit/stop-loss levels. Tells you: keep holding, take profit, or cut your loss.",
+            "longterm": "Reviews each position against **fundamental and trend signals** — P/E ratio, analyst rating, "
+                        "and the 200-day moving average. Long-term investors should ignore short-term dips unless "
+                        "the underlying business has changed.",
+        }
+        st.caption(_eck_desc.get(_persona_key, _eck_desc["swing"]))
 
         if st.button("▶  Run Engine Check", type="primary"):
             results = []
@@ -651,11 +973,676 @@ if mode == "Portfolio":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PRE-BELL SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
+elif mode == "Pre-Bell Scanner":
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+    now_et = datetime.now(tz=_ET)
+
+    st.title("🌅 Pre-Bell Scanner")
+
+    _prebell_desc = {
+        "day": (
+            "**Your morning alarm before the market opens.** "
+            "The stock market opens at 9:30 AM ET, but prices start moving as early as 4 AM in 'pre-market' trading. "
+            "This scanner checks what happened overnight — did a stock gap up or down? Is volume spiking? — "
+            "so you're ready to act the moment the bell rings.  \n\n"
+            "⚡ **Day traders use this most.** A pre-market gap + high volume = the best intraday setups."
+        ),
+        "swing": (
+            "**A morning briefing before the market opens.** "
+            "Checks overnight price movements and whether your planned swing trades are still valid. "
+            "A big overnight gap can blow up a setup — this tells you before you commit money.  \n\n"
+            "🔄 **Best used 8–9:25 AM ET**, before the regular session begins at 9:30 AM."
+        ),
+        "longterm": (
+            "**Optional morning check for long-term investors.** "
+            "This scanner is primarily designed for short-term traders, but long-term investors can use it "
+            "to spot big overnight moves in stocks they're watching — earnings surprises, news events, or "
+            "major gaps that might create a better entry price.  \n\n"
+            "📈 **Long-term tip:** A stock gapping DOWN 5% on temporary bad news is often a *buying opportunity*, "
+            "not a reason to panic."
+        ),
+    }
+    st.markdown(_prebell_desc.get(_persona_key, _prebell_desc["swing"]))
+    st.caption("Best run **4:00–9:25 AM ET**. After 9:30 AM the market is open and pre-market data becomes stale.")
+
+    # ── Session badge ─────────────────────────────────────────────────────────
+    if now_et.hour < 4:
+        st.info("⏳ Before 4 AM ET — pre-market hasn't opened yet. Data will be limited.")
+    elif now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+        st.success(f"🌅 Pre-market session open — {now_et.strftime('%H:%M ET')}")
+    elif now_et.hour < 16:
+        st.warning("📈 Regular session is open — pre-market data may be stale.")
+    else:
+        st.info("🌙 After hours — reviewing EOD data for tomorrow's plan.")
+
+    st.markdown("---")
+
+    # ── Ticker selection ──────────────────────────────────────────────────────
+    st.subheader("Select tickers to scan")
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        custom_input = st.text_input(
+            "Enter tickers (comma-separated) — leave blank to use full TRADING_UNIVERSE",
+            placeholder="e.g. AAPL, NVDA, TSLA, MSFT",
+        )
+    with col_b:
+        st.markdown("<br>", unsafe_allow_html=True)
+        use_holdings = st.checkbox("My holdings only", value=False)
+
+    if use_holdings:
+        tickers_to_scan = list(profile_state.get("holdings", {}).keys()) or mm.TRADING_UNIVERSE
+    elif custom_input.strip():
+        tickers_to_scan = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+    else:
+        tickers_to_scan = mm.TRADING_UNIVERSE
+
+    st.caption(f"Scanning **{len(tickers_to_scan)}** tickers: {', '.join(tickers_to_scan)}")
+
+    run_prebell = st.button("▶  Run Pre-Bell Scan", type="primary", use_container_width=True)
+
+    if run_prebell:
+        # ── Fetch all data ────────────────────────────────────────────────────
+        with st.spinner("Fetching pre-market data..."):
+            gaps = fetch_gap_info(tickers_to_scan)
+
+        with st.spinner("Fetching technical indicators..."):
+            techs   = {t: mm.get_technical_indicators(t) for t in tickers_to_scan}
+            weeklys = {t: mm.get_weekly_return(t) for t in tickers_to_scan}
+
+        # ── Compute signals ───────────────────────────────────────────────────
+        signals = []
+        for ticker in tickers_to_scan:
+            gap    = gaps[ticker]
+            tech   = techs[ticker]
+            weekly = weeklys[ticker]
+            signal, reason = compute_signal(gap, tech)
+            signals.append({
+                "ticker": ticker, "gap": gap,
+                "tech": tech, "weekly": weekly,
+                "signal": signal, "reason": reason,
+            })
+
+        # Save to session state so Ask MarketMind can reference them
+        st.session_state["prebell_signals"] = signals
+
+        # ── Summary metrics ───────────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Summary")
+
+        n_buy   = sum(1 for s in signals if s["signal"] == "BUY")
+        n_sell  = sum(1 for s in signals if s["signal"] == "SELL")
+        n_watch = sum(1 for s in signals if s["signal"] == "WATCH")
+        n_skip  = sum(1 for s in signals if s["signal"] == "SKIP")
+        n_high  = sum(1 for s in signals if s["gap"].gap_risk == GapRisk.HIGH)
+        n_mod   = sum(1 for s in signals if s["gap"].gap_risk == GapRisk.MODERATE)
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("🟢 BUY",    n_buy)
+        m2.metric("🔴 SELL",   n_sell)
+        m3.metric("🟡 WATCH",  n_watch)
+        m4.metric("⛔ SKIP",   n_skip)
+        m5.metric("🔴 High Gap Risk",  n_high)
+        m6.metric("🟡 Moderate Gap",   n_mod)
+
+        # ── Signal table ──────────────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("All Signals")
+
+        _RISK_ICONS = {"low": "🟢", "moderate": "🟡", "high": "🔴"}
+        _SIG_ICONS  = {"BUY": "🟢", "SELL": "🔴", "WATCH": "🟡", "SKIP": "⛔", "ERROR": "❌"}
+
+        table_rows = []
+        for s in signals:
+            g  = s["gap"]
+            t  = s["tech"]
+            wk = s["weekly"]
+            table_rows.append({
+                "Signal":      f"{_SIG_ICONS.get(s['signal'], '?')} {s['signal']}",
+                "Ticker":      s["ticker"],
+                "Price":       f"${t.get('current_price', g.prev_close):.2f}" if not t.get("error") else "N/A",
+                "7-Day":       f"{wk.get('weekly_return_pct', 0):+.2f}%" if not wk.get("error") else "N/A",
+                "PM Gap %":    f"{g.gap_pct:+.2f}%" if g.data_available else "N/A",
+                "Gap Risk":    f"{_RISK_ICONS.get(g.gap_risk.value, '')} {g.gap_risk.value}" if g.data_available else "N/A",
+                "PM Vol":      f"{g.pm_vol_ratio:.1%}" if g.data_available else "N/A",
+                "Conviction":  "⚡ Yes" if g.high_conviction else "—",
+                "RSI":         t.get("rsi_14d", "—") if not t.get("error") else "—",
+                "MACD":        t.get("macd_signal", "—") if not t.get("error") else "—",
+                "BB %":        f"{t.get('bb_price_position_pct', '—'):.0f}%" if not t.get("error") and t.get("bb_price_position_pct") else "—",
+                "Reason":      s["reason"],
+            })
+
+        # Sort: BUY first, then SELL, WATCH, SKIP, ERROR
+        order = {"BUY": 0, "SELL": 1, "WATCH": 2, "SKIP": 3, "ERROR": 4}
+        table_rows.sort(key=lambda r: order.get(r["Signal"].split()[-1], 5))
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+        # ── Expanded per-ticker cards ─────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Detailed View")
+
+        buy_signals  = [s for s in signals if s["signal"] == "BUY"]
+        sell_signals = [s for s in signals if s["signal"] == "SELL"]
+        watch_signals= [s for s in signals if s["signal"] == "WATCH"]
+        skip_signals = [s for s in signals if s["signal"] == "SKIP"]
+
+        def _render_signal_cards(group: list, label: str, colour: str) -> None:
+            if not group:
+                return
+            st.markdown(f"#### {colour} {label}")
+            for s in group:
+                g  = s["gap"]
+                t  = s["tech"]
+                wk = s["weekly"]
+                price = t.get("current_price", g.prev_close) if not t.get("error") else g.prev_close
+                wk_str = f"{wk.get('weekly_return_pct', 0):+.2f}%" if not wk.get("error") else "N/A"
+
+                with st.expander(
+                    f"{colour} **{s['ticker']}**  ${price:.2f}  (7d: {wk_str})  —  {s['reason'][:80]}..."
+                    if len(s["reason"]) > 80 else f"{colour} **{s['ticker']}**  ${price:.2f}  (7d: {wk_str})  —  {s['reason']}"
+                ):
+                    c1, c2, c3 = st.columns(3)
+
+                    # Pre-market
+                    with c1:
+                        st.markdown("**Pre-Market**")
+                        if g.data_available:
+                            risk_icon = _RISK_ICONS.get(g.gap_risk.value, "")
+                            st.metric("Gap %",    f"{g.gap_pct:+.2f}%")
+                            st.metric("PM Price", f"${g.pm_last_price:.2f}", f"prev ${g.prev_close:.2f}")
+                            st.caption(f"Risk: {risk_icon} {g.gap_risk.value}")
+                            st.caption(f"PM vol: {g.pm_volume:,} ({g.pm_vol_ratio:.1%} of daily avg)")
+                            if g.high_conviction:
+                                st.success("⚡ High conviction volume")
+                        else:
+                            st.caption("No pre-market data available")
+
+                    # Technical indicators
+                    with c2:
+                        st.markdown("**Technicals**")
+                        if not t.get("error"):
+                            st.metric("RSI (14d)", t.get("rsi_14d", "—"), t.get("rsi_signal", ""))
+                            st.metric("MACD",      t.get("macd_signal", "—"))
+                            st.metric("Stoch %K",  t.get("stoch_k", "—"), t.get("stoch_signal", ""))
+                        else:
+                            st.caption(f"Error: {t['error']}")
+
+                    # More technicals
+                    with c3:
+                        st.markdown("**Bands & Volume**")
+                        if not t.get("error"):
+                            bb_pct = t.get("bb_price_position_pct")
+                            st.metric("BB Position", f"{bb_pct:.0f}th %" if bb_pct else "—", t.get("bb_signal", ""))
+                            st.metric("Volume",      f"{t.get('volume_ratio', '—')}x avg", t.get("volume_signal", ""))
+                            st.caption(t.get("ma_signal", ""))
+
+                    st.caption(f"**Signal reason:** {s['reason']}")
+
+        _render_signal_cards(buy_signals,   "BUY",   "🟢")
+        _render_signal_cards(sell_signals,  "SELL",  "🔴")
+        _render_signal_cards(watch_signals, "WATCH", "🟡")
+        _render_signal_cards(skip_signals,  "SKIP",  "⛔")
+
+        # ── Gap risk warning ──────────────────────────────────────────────────
+        high_risk_tickers = [s["ticker"] for s in signals if s["gap"].gap_risk == GapRisk.HIGH]
+        moderate_tickers  = [s["ticker"] for s in signals if s["gap"].gap_risk == GapRisk.MODERATE]
+
+        if high_risk_tickers or moderate_tickers:
+            st.markdown("---")
+            st.subheader("⚠️ Gap Risk Alerts")
+            if high_risk_tickers:
+                st.error(
+                    f"**🔴 High gap risk — signals suppressed for:** {', '.join(high_risk_tickers)}  \n"
+                    "These stocks gapped >5% from yesterday's close. Entry price has moved too far — "
+                    "risk/reward has collapsed. Wait for price to stabilise after open."
+                )
+            if moderate_tickers:
+                st.warning(
+                    f"**🟡 Moderate gap (2–5%) — reduce position size for:** {', '.join(moderate_tickers)}  \n"
+                    "Consider using a limit order near yesterday's close rather than buying at market open."
+                )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ASK MARKETMIND — conversational follow-up Q&A
+# ══════════════════════════════════════════════════════════════════════════════
+elif mode == "Ask MarketMind":
+    import anthropic as _anthropic
+
+    st.title("💬 Ask MarketMind")
+    st.caption(
+        "Ask anything about your portfolio, today's signals, pre-market conditions, "
+        "or general trading questions. MarketMind answers with your live data as context."
+    )
+
+    # ── Build context snapshot for Claude ────────────────────────────────────
+    holdings      = profile_state.get("holdings", {})
+    cash          = profile_state.get("cash_available", 0)
+    total_val     = profile_state.get("total_portfolio_value", 0)
+    risk_level    = profile_state.get("risk_level", "moderate")
+    take_profit   = profile_state.get("take_profit_pct", 5.0)
+    stop_loss     = profile_state.get("stop_loss_pct", 2.0)
+
+    def _build_system_prompt() -> str:
+        _pcfg = mm.PERSONA_CONFIGS.get(_persona_key, mm.PERSONA_CONFIGS["swing"])
+        _weights = _pcfg["weights"]
+        _top_signals = sorted(_weights.items(), key=lambda kv: -kv[1])
+        _signal_priority = ", ".join(
+            f"{k} (weight {v})" for k, v in _top_signals if v > 0
+        )
+        lines = [
+            f"You are MarketMind, an expert AI trading assistant.",
+            f"The user's active trading persona is: {_pcfg['emoji']} {_pcfg['label']}.",
+            f"Persona tagline: \"{_pcfg['tagline']}\"",
+            f"Prioritised signals for this persona: {_signal_priority}.",
+            f"What this persona focuses on: {', '.join(_pcfg['focus'])}.",
+            f"What this persona avoids: {', '.join(_pcfg['avoid'])}.",
+            f"Calibrate ALL advice to this persona — a day trader does not want to hear about P/E ratios; "
+            f"a long-term investor does not care about intraday volume spikes.",
+            "Be direct, concise, and practical. Always caveat: educational only, not licensed financial advice.",
+            "",
+            f"=== PROFILE: {active_profile} ===",
+            f"Trading persona: {_pcfg['emoji']} {_pcfg['label']} — take-profit +{take_profit}%, stop-loss -{stop_loss}%",
+            f"Max hold period: {_pcfg['hold_label']}  |  Max open trades: {_pcfg['max_open_trades']}",
+            f"Risk level: {risk_level}",
+            f"Cash available: ${cash:,.2f}",
+            f"Total portfolio value: ${total_val:,.2f}",
+            f"Today's date: {date.today().strftime('%A, %B %d, %Y')}",
+        ]
+
+        if holdings:
+            lines.append("\n=== CURRENT HOLDINGS ===")
+            for ticker, pos in holdings.items():
+                unreal     = pos.get("unrealized_pnl", 0)
+                unreal_pct = pos.get("unrealized_pct", 0)
+                shares     = pos.get("shares", 0)
+                avg_buy    = pos.get("avg_buy_price", 0)
+                cur_price  = pos.get("current_price", avg_buy)
+                lines.append(
+                    f"  {ticker}: {shares} shares @ avg ${avg_buy:.2f} | "
+                    f"current ${cur_price:.2f} | P&L ${unreal:+,.2f} ({unreal_pct:+.1f}%)"
+                )
+        else:
+            lines.append("\n=== HOLDINGS: none imported yet ===")
+
+        # Attach pre-bell scan results if they exist in session state
+        if "prebell_signals" in st.session_state and st.session_state.prebell_signals:
+            lines.append("\n=== LATEST PRE-BELL SCAN RESULTS ===")
+            for s in st.session_state.prebell_signals:
+                g = s["gap"]
+                t = s["tech"]
+                gap_str = f"gap {g.gap_pct:+.2f}% ({g.gap_risk.value} risk)" if g.data_available else "no PM data"
+                rsi_str = f"RSI {t.get('rsi_14d','?')}" if not t.get("error") else "tech N/A"
+                lines.append(
+                    f"  {s['ticker']}: signal={s['signal']} | {gap_str} | {rsi_str} | {s['reason'][:80]}"
+                )
+
+        lines += [
+            "",
+            "Answer the user's question using this context where relevant.",
+            "If asked about a ticker not in the portfolio or scan, fetch what you know from training.",
+            "Keep answers focused — traders need clarity, not essays.",
+        ]
+        return "\n".join(lines)
+
+    # ── Session state for chat history ────────────────────────────────────────
+    chat_key = f"chat_history_{active_profile}"
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+
+    # ── Suggested starter questions ───────────────────────────────────────────
+    if not st.session_state[chat_key]:
+        st.markdown("**Try asking:**")
+        suggestions = [
+            "Which of my holdings should I be watching most closely today?",
+            "Explain the pre-market gap risk for my portfolio",
+            "Should I take profit on any positions?",
+            "What does a MACD bearish crossover mean for my trade?",
+            "Which tickers from the scan look most interesting?",
+        ]
+        cols = st.columns(len(suggestions))
+        for col, q in zip(cols, suggestions):
+            if col.button(q, use_container_width=True):
+                st.session_state[chat_key].append({"role": "user", "content": q})
+                st.rerun()
+
+        st.markdown("---")
+
+    # ── Render chat history ───────────────────────────────────────────────────
+    for msg in st.session_state[chat_key]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # ── Chat input ────────────────────────────────────────────────────────────
+    if user_input := st.chat_input("Ask a follow-up question about your portfolio or signals…"):
+        st.session_state[chat_key].append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # Call Claude
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            with st.chat_message("assistant"):
+                st.error("ANTHROPIC_API_KEY not set. Add it to your .env file.")
+        else:
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    try:
+                        client = _anthropic.Anthropic(api_key=api_key)
+                        response = client.messages.create(
+                            model="claude-opus-4-6",
+                            max_tokens=1024,
+                            system=_build_system_prompt(),
+                            messages=[
+                                {"role": m["role"], "content": m["content"]}
+                                for m in st.session_state[chat_key]
+                            ],
+                        )
+                        reply = response.content[0].text
+                    except Exception as e:
+                        reply = f"❌ Error calling Claude: {e}"
+
+                st.markdown(reply)
+                st.session_state[chat_key].append({"role": "assistant", "content": reply})
+
+    # ── Sidebar controls ──────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("---")
+        if st.button("🗑️ Clear chat history"):
+            st.session_state[chat_key] = []
+            st.rerun()
+        st.caption(f"{len(st.session_state[chat_key])} messages in this session")
+        if holdings:
+            st.caption(f"Context includes {len(holdings)} holdings")
+        if "prebell_signals" in st.session_state and st.session_state.prebell_signals:
+            st.caption(f"+ {len(st.session_state.prebell_signals)} pre-bell signals")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAX CALCULATOR
+# ══════════════════════════════════════════════════════════════════════════════
+elif mode == "Tax Calculator":
+    st.title("🧾 Tax Calculator")
+    st.markdown(
+        "**Estimates how much tax you'd owe if you sold your positions today.**  \n\n"
+        "In the US, profits from selling stocks are called **capital gains** and they're taxable. "
+        "The rate depends on how long you held the stock:  \n"
+        "- **Short-term** (held less than 1 year): taxed at your regular income rate — same as your salary  \n"
+        "- **Long-term** (held 1 year or more): taxed at a lower special rate of 0%, 15%, or 20%  \n\n"
+        "This tool shows you which of your positions are short- vs long-term, how close each is to the "
+        "1-year threshold, and whether selling a losing position could reduce your overall tax bill "
+        "(a strategy called **tax-loss harvesting**)."
+    )
+    st.caption("⚠️ Federal estimates only. State taxes, AMT, and wash-sale adjustments not included — consult a CPA for your full picture.")
+
+    holdings = profile_state.get("holdings", {})
+
+    if not holdings:
+        st.info("No holdings found. Import your Robinhood data in the Portfolio tab first.")
+        st.stop()
+
+    # ── Tax bracket override ──────────────────────────────────────────────────
+    st.subheader("⚙️ Your Tax Settings")
+    col_tx1, col_tx2, col_tx3 = st.columns(3)
+    with col_tx1:
+        bracket = st.selectbox(
+            "Federal income tax bracket",
+            [10, 12, 22, 24, 32, 35, 37],
+            index=[10, 12, 22, 24, 32, 35, 37].index(int(profile_state.get("tax_bracket_pct", 22))),
+            help="Your marginal federal rate. Short-term gains are taxed at this rate."
+        )
+    with col_tx2:
+        lt_rate_display = 0 if bracket <= 12 else (15 if bracket <= 35 else 20)
+        st.metric("Long-term gains rate", f"{lt_rate_display}%",
+                  help="Applies to positions held ≥ 365 days.")
+    with col_tx3:
+        st.metric("Short-term gains rate", f"{bracket}%",
+                  help="Applies to positions held < 365 days — all typical swing trades.")
+
+    # Recompute with the selected bracket
+    tax_data = mm.compute_tax_implications(holdings, float(bracket))
+
+    lt_rate  = bracket / 100 * (0 if bracket <= 12 else (0.15 / (bracket / 100) if bracket <= 35 else 0.20 / (bracket / 100)))
+    lt_rate  = 0.0 if bracket <= 12 else (0.15 if bracket <= 35 else 0.20)
+    st_rate  = bracket / 100
+
+    # ── Aggregate summary ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 Portfolio Tax Summary")
+
+    total_unrealized       = sum(td["unrealized_gain"] for td in tax_data.values())
+    total_gains            = sum(td["unrealized_gain"] for td in tax_data.values() if td["unrealized_gain"] > 0)
+    total_losses           = sum(td["unrealized_gain"] for td in tax_data.values() if td["unrealized_gain"] < 0)
+    total_est_tax          = sum(td["est_tax_if_sold_now"] for td in tax_data.values())
+    st_gains               = sum(td["unrealized_gain"] for td in tax_data.values() if td["gain_type"] == "Short-term" and td["unrealized_gain"] > 0)
+    lt_gains               = sum(td["unrealized_gain"] for td in tax_data.values() if td["gain_type"] == "Long-term"  and td["unrealized_gain"] > 0)
+    tax_if_offset          = max(0, total_gains + total_losses) * st_rate   # rough: losses offset gains
+    net_after_tax          = total_unrealized - total_est_tax
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Total Unrealized P&L",    f"${total_unrealized:+,.2f}")
+    s2.metric("Est. Tax (all sold now)", f"${total_est_tax:,.2f}",
+              delta=f"-{total_est_tax/total_gains*100:.0f}% of gains" if total_gains > 0 else None,
+              delta_color="inverse")
+    s3.metric("Keep After Tax",          f"${net_after_tax:,.2f}")
+    s4.metric("Losses to Harvest",       f"${abs(total_losses):,.2f}",
+              help="Selling losing positions offsets gains and reduces tax bill.")
+
+    # Gain type breakdown
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Short-term gains",  f"${st_gains:,.2f}",  f"taxed at {bracket}%")
+    g2.metric("Long-term gains",   f"${lt_gains:,.2f}",  f"taxed at {lt_rate_display}%")
+    g3.metric("Tax if losses offset gains", f"${tax_if_offset:,.2f}",
+              delta=f"save ${total_est_tax - tax_if_offset:,.2f}" if total_losses < 0 else "no losses to use",
+              delta_color="normal")
+
+    # ── Per-position breakdown ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Per-Position Tax Breakdown")
+
+    rows = []
+    for ticker, td in tax_data.items():
+        pos         = holdings[ticker]
+        gain        = td["unrealized_gain"]
+        gain_type   = td["gain_type"]
+        holding_days= td.get("holding_days")
+        days_to_lt  = td.get("days_to_lt")
+        est_tax     = td["est_tax_if_sold_now"]
+        rate        = td["effective_rate_pct"]
+        harvest     = td["tax_loss_harvest"]
+
+        # Days to LT label
+        if gain_type == "Long-term":
+            lt_label = "✅ Long-term"
+        elif days_to_lt is not None and days_to_lt <= 30:
+            lt_label = f"⚠️ {days_to_lt}d to LT"
+        elif days_to_lt is not None:
+            lt_label = f"🕐 {days_to_lt}d to LT"
+        else:
+            lt_label = "Unknown"
+
+        rows.append({
+            "Ticker":           ticker,
+            "Shares":           pos.get("shares", 0),
+            "Avg Buy":          f"${pos.get('avg_buy_price', 0):.2f}",
+            "Current":          f"${pos.get('current_price', 0):.2f}",
+            "Unrealized P&L":   f"${gain:+,.2f}",
+            "Held":             f"{holding_days}d" if holding_days else "?",
+            "Gain Type":        gain_type,
+            "LT Status":        lt_label,
+            "Tax Rate":         f"{rate}%",
+            "Est. Tax":         f"${est_tax:,.2f}" if gain > 0 else ("Harvest 🎯" if harvest else "—"),
+            "Net After Tax":    f"${gain - est_tax:,.2f}" if gain > 0 else f"${gain:,.2f}",
+        })
+
+    # Sort: losses first (harvest), then by est tax descending
+    rows.sort(key=lambda r: (0 if r["Est. Tax"] == "Harvest 🎯" else 1, r["Ticker"]))
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── What-if: wait for long-term ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("💡 What-If: Wait for Long-Term Rate")
+    st.caption("Shows how much you'd save in tax by holding each profitable short-term position until it qualifies for long-term rates.")
+
+    waitfor_rows = []
+    for ticker, td in tax_data.items():
+        if td["gain_type"] != "Short-term" or td["unrealized_gain"] <= 0:
+            continue
+        gain        = td["unrealized_gain"]
+        days_to_lt  = td.get("days_to_lt", 0) or 0
+        tax_now     = round(gain * st_rate, 2)
+        tax_lt      = round(gain * lt_rate, 2)
+        savings     = round(tax_now - tax_lt, 2)
+        waitfor_rows.append({
+            "Ticker":           ticker,
+            "Unrealized Gain":  f"${gain:,.2f}",
+            "Days to LT":       days_to_lt,
+            "Tax if Sold Now":  f"${tax_now:,.2f}",
+            "Tax at LT Rate":   f"${tax_lt:,.2f}",
+            "Potential Saving": f"${savings:,.2f}",
+            "Worth Waiting?":   "✅ Yes" if savings > 200 else ("⚠️ Marginal" if savings > 50 else "❌ No"),
+        })
+
+    if waitfor_rows:
+        waitfor_rows.sort(key=lambda r: -float(r["Potential Saving"].replace("$","").replace(",","")))
+        st.dataframe(pd.DataFrame(waitfor_rows), use_container_width=True, hide_index=True)
+
+        top_saver = waitfor_rows[0]
+        st.info(
+            f"**Biggest opportunity:** {top_saver['Ticker']} — waiting {top_saver['Days to LT']} more days "
+            f"could save you **{top_saver['Potential Saving']}** in federal tax."
+        )
+    else:
+        st.success("All profitable positions are already long-term — you're at the lowest applicable rate.")
+
+    # ── Tax-loss harvesting ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🎯 Tax-Loss Harvesting Opportunities")
+    st.caption(
+        "Selling losing positions crystallises the loss, which offsets gains elsewhere and reduces your total tax bill. "
+        "**Wash-sale rule:** don't buy the same stock back within 30 days or the loss is disallowed."
+    )
+
+    harvest_rows = []
+    total_harvestable = 0.0
+    for ticker, td in tax_data.items():
+        if not td["tax_loss_harvest"]:
+            continue
+        loss        = abs(td["unrealized_gain"])
+        tax_saved   = round(loss * st_rate, 2)   # offsets short-term gains first
+        total_harvestable += tax_saved
+        harvest_rows.append({
+            "Ticker":           ticker,
+            "Unrealized Loss":  f"-${loss:,.2f}",
+            "Est. Tax Saved":   f"${tax_saved:,.2f}",
+            "Held":             f"{td.get('holding_days','?')}d",
+            "Wash-Sale Window": "30 days — don't rebuy immediately",
+        })
+
+    if harvest_rows:
+        harvest_rows.sort(key=lambda r: -float(r["Est. Tax Saved"].replace("$","").replace(",","")))
+        st.dataframe(pd.DataFrame(harvest_rows), use_container_width=True, hide_index=True)
+        st.success(
+            f"Harvesting all losing positions could save up to **${total_harvestable:,.2f}** in federal tax "
+            f"by offsetting gains. Remember the 30-day wash-sale window."
+        )
+    else:
+        st.info("No losing positions to harvest right now.")
+
+    # ── Tax-optimised exit order ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📌 Tax-Optimised Exit Order")
+    st.caption(
+        "If you need to raise cash, this is the order to sell your positions to minimise tax impact."
+    )
+
+    exit_rows = []
+    for ticker, td in tax_data.items():
+        gain      = td["unrealized_gain"]
+        est_tax   = td["est_tax_if_sold_now"]
+        mkt_val   = holdings[ticker].get("market_value", 0)
+        tax_drag  = round(est_tax / mkt_val * 100, 1) if mkt_val else 0
+
+        if td["tax_loss_harvest"]:
+            priority = 1
+            label    = "🥇 Sell first — harvests a loss"
+        elif td["gain_type"] == "Long-term":
+            priority = 2
+            label    = "🥈 Sell second — long-term rate applies"
+        elif td.get("days_to_lt") and td["days_to_lt"] <= 30:
+            priority = 3
+            label    = f"🕐 Wait {td['days_to_lt']}d — almost long-term"
+        else:
+            priority = 4
+            label    = "🥉 Sell last — short-term gain, highest tax"
+
+        exit_rows.append({
+            "Priority":         priority,
+            "Ticker":           ticker,
+            "Market Value":     f"${mkt_val:,.2f}",
+            "Unrealized P&L":   f"${gain:+,.2f}",
+            "Est. Tax":         f"${est_tax:,.2f}" if gain > 0 else "—",
+            "Tax Drag":         f"{tax_drag}%" if gain > 0 else "—",
+            "Recommendation":   label,
+        })
+
+    exit_rows.sort(key=lambda r: r["Priority"])
+    st.dataframe(pd.DataFrame(exit_rows), use_container_width=True, hide_index=True)
+
+    st.caption(
+        "⚠️ Federal estimates only. Does not account for state income tax, AMT, NIIT (net investment income tax "
+        "for high earners), or wash-sale adjustments from prior periods. Consult a CPA before making tax-driven decisions."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DAILY TRADE SCAN
 # ══════════════════════════════════════════════════════════════════════════════
 elif mode == "Daily Trade Scan":
-    st.title(f"📊 Daily Trade Scan — {active_profile}")
-    st.caption(f"Scans {len(mm.TRADING_UNIVERSE)} stocks for swing trade setups — {date.today().strftime('%A, %B %d %Y')}")
+    _scan_meta = {
+        "day": {
+            "title":   "⚡ Daily Trade Scan — Day Trading Mode",
+            "desc":    (
+                "**Finds stocks to buy and sell today.** "
+                "MarketMind scans your full watchlist and flags stocks with volume spikes and intraday momentum — "
+                "the two things day traders care most about.  \n\n"
+                "Day trading means you enter and exit within the same market session (9:30 AM–4 PM ET). "
+                "You need **tight stop-losses** (-0.75%) and **quick profit-taking** (+1.5%) — small, fast gains add up. "
+                "Any position from today's scan should be **closed before market close**."
+            ),
+            "filter_note": "📊 *Day trading filter applied: only stocks with volume >1.5× average and clear momentum qualify.*",
+        },
+        "swing": {
+            "title":   "📊 Daily Trade Scan — Swing Trading Mode",
+            "desc":    (
+                "**Finds stocks to buy and hold for 2–5 days.** "
+                "MarketMind scans your watchlist for technical setups — RSI oversold bounces, MACD crossovers, "
+                "and Bollinger Band breakouts — then sizes each trade so you never risk more than 2% of your capital.  \n\n"
+                "Swing trading means you hold a position overnight and exit when it hits your take-profit (+5%) "
+                "or stop-loss (-2%). You don't need to watch it every minute — just check once a day."
+            ),
+            "filter_note": "📊 *Swing filter applied: RSI, MACD, and momentum signals required.*",
+        },
+        "longterm": {
+            "title":   "📈 Daily Trade Scan — Long-term Investing Mode",
+            "desc":    (
+                "**Finds quality stocks to hold for months.** "
+                "MarketMind scans for stocks trading above their 200-day moving average (a proxy for long-term health) "
+                "with solid analyst ratings and fundamental strength.  \n\n"
+                "Long-term investing means you ignore short-term dips — you're buying the company, not the chart. "
+                "A wide stop-loss (-8%) protects against real deterioration without getting shaken out by noise. "
+                "Think of this as a monthly review, not a daily trade."
+            ),
+            "filter_note": "📊 *Long-term filter applied: stocks must be above 200-day EMA with positive analyst ratings.*",
+        },
+    }
+    _sm = _scan_meta.get(_persona_key, _scan_meta["swing"])
+    st.title(_sm["title"])
+    st.markdown(_sm["desc"])
+    st.caption(f"Scanning {len(mm.TRADING_UNIVERSE)} stocks — {date.today().strftime('%A, %B %d %Y')}")
+    st.info(_sm["filter_note"])
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -836,14 +1823,39 @@ elif mode == "Daily Trade Scan":
 # STOCK FORECAST
 # ══════════════════════════════════════════════════════════════════════════════
 elif mode == "Stock Forecast":
+    _sf_desc = {
+        "day": (
+            "**Research before you trade.** Heard about a stock on the news or social media? "
+            "Drop the ticker in here and get a full breakdown: is the volume spiking? Is momentum building or fading? "
+            "Day traders need to act fast — this tool gives you a quick STRONG BUY / AVOID verdict before you commit.  \n"
+            "💡 *Tip: Check volume and momentum first. If volume is below average, skip it — day trading low-volume stocks is risky.*"
+        ),
+        "swing": (
+            "**Deep-dive on any stock before you enter.** Heard about a stock and wondering if now is a good time to buy? "
+            "Enter the ticker and get a full technical picture: RSI, MACD, Bollinger Bands, sentiment, and a STRONG BUY / AVOID verdict.  \n"
+            "💡 *Tip: A stock is only interesting if RSI is below 60 and MACD is turning bullish — don't buy what's already overbought.*"
+        ),
+        "longterm": (
+            "**Research any company before investing.** Thinking about buying a stock for the long haul? "
+            "This tool shows you everything that matters for long-term investors: P/E ratio, analyst target price, profit margins, "
+            "and whether the stock is in a long-term uptrend (above the 200-day moving average).  \n"
+            "💡 *Tip: For long-term investing, fundamentals matter more than chart patterns. Focus on P/E ratio and analyst rating.*"
+        ),
+    }
     st.title(f"🔍 Stock Forecast — {active_profile}")
+    st.markdown(_sf_desc.get(_persona_key, _sf_desc["swing"]))
 
     tab_recs, tab_analyse = st.tabs(["💡 Stock Recommendations", "🔎 Analyse a Stock"])
 
     # ── Tab 1: Stock Recommendations ─────────────────────────────────────────
     with tab_recs:
         st.subheader("💡 Stock Recommendations")
-        st.caption("Scans ~165 stocks across 11 sectors for bullish setups you don't already hold.")
+        _rec_cap = {
+            "day":      "Scans ~165 stocks for volume spikes and intraday momentum setups — day-trade candidates.",
+            "swing":    "Scans ~165 stocks across 11 sectors for bullish setups you don't already hold.",
+            "longterm": "Scans ~165 stocks for quality companies above their 200-day EMA with strong analyst ratings.",
+        }
+        st.caption(_rec_cap.get(_persona_key, _rec_cap["swing"]))
 
         held_tickers = list(profile_state.get("holdings", {}).keys())
 
@@ -988,7 +2000,15 @@ elif mode == "Stock Forecast":
 # ══════════════════════════════════════════════════════════════════════════════
 elif mode == "Top 10 Snapshot":
     st.title("🏆 Top 10 US Stocks Snapshot")
-    st.caption("Live prices, analyst targets, and 7-day rule-based predictions")
+    st.markdown(
+        "**A live pulse check on the 10 biggest companies in the US stock market.** "
+        "This includes Apple, Microsoft, NVIDIA, Amazon, Alphabet (Google), Meta, "
+        "Berkshire Hathaway, Eli Lilly, Broadcom, and Tesla.  \n\n"
+        "Each row shows the current price, where Wall Street analysts think it will be in 12 months (**analyst target**), "
+        "how much it moved this week, and MarketMind's own 7-day rule-based prediction.  \n\n"
+        "Think of this as a morning newspaper for the biggest stocks — a quick scan to see what's moving and what analysts expect."
+    )
+    st.caption("Data from Yahoo Finance + MarketMind's rule-based prediction engine. Predictions are for educational purposes only.")
 
     if st.button("▶  Fetch Snapshot", type="primary"):
         TOP10 = [
@@ -1037,6 +2057,16 @@ elif mode == "Top 10 Snapshot":
 elif mode == "Backtest":
     from datetime import timedelta
     st.title("🔬 Backtest MarketMind Predictions")
+    st.markdown(
+        "**See how accurate MarketMind's predictions were last week.**  \n\n"
+        "MarketMind goes back 10 trading days and pretends it's running on that date — "
+        "using only data that existed at the time (no cheating). It generates the same predictions "
+        "it would have made, then compares those predictions to what actually happened.  \n\n"
+        "This tells you: did MarketMind correctly predict whether a stock would go **up or down**? "
+        "And by how much did the prediction miss?  \n\n"
+        "💡 *No system is right 100% of the time. A 60–70% directional accuracy (up/down correct) "
+        "is considered good — even professional fund managers often fall short of that.*"
+    )
 
     pred_date   = date.today() - timedelta(days=10)
     actual_date = date.today() - timedelta(days=1)
