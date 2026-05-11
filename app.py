@@ -87,8 +87,24 @@ def save_profile(name: str, state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
+def _init_session() -> None:
+    if "authenticated_profile" not in st.session_state:
+        st.session_state.authenticated_profile = None
+
+
+def verify_pin(name: str, pin: str) -> bool:
+    import hashlib
+    state = load_profile(name)
+    stored_hash = state.get("pin_hash")
+    if not stored_hash:
+        return True  # legacy profiles without a PIN are always accessible
+    return hashlib.sha256(pin.strip().encode()).hexdigest() == stored_hash
+
+
 def create_profile(name: str, capital: float, risk_level: str,
-                   tax_bracket_pct: float = 22.0, trading_persona: str = "swing") -> dict:
+                   tax_bracket_pct: float = 22.0, trading_persona: str = "swing",
+                   pin: str = "0000") -> dict:
+    import hashlib
     tp = {"conservative": 3.0, "moderate": 5.0, "aggressive": 8.0}[risk_level]
     sl = {"conservative": 1.5, "moderate": 2.0, "aggressive": 3.0}[risk_level]
 
@@ -96,6 +112,7 @@ def create_profile(name: str, capital: float, risk_level: str,
     persona_cfg = mm.PERSONA_CONFIGS.get(trading_persona, mm.PERSONA_CONFIGS["swing"])
     state = {
         "profile_name":          name,
+        "pin_hash":              hashlib.sha256(pin.strip().encode()).hexdigest(),
         "initial_investment":    capital,
         "cash_available":        capital,
         "total_portfolio_value": capital,
@@ -390,114 +407,88 @@ def signal_colour(sig: str) -> str:
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+_init_session()
+
 st.sidebar.title("📈 MarketMind")
 st.sidebar.caption("Free swing trading signals — yfinance powered")
 st.sidebar.markdown("---")
 
-# Profile selector
-st.sidebar.subheader("👤 Profile")
 existing = list_profiles()
 
-with st.sidebar.expander("＋ Create new profile"):
-    new_name = st.text_input(
-        "Profile name",
-        placeholder="e.g. My Growth Fund",
-        help="A label for this trading account. You can have multiple profiles (e.g. one conservative, one aggressive). Doesn't affect any trades.",
-    )
-    new_capital = st.number_input(
-        "Starting budget ($)",
-        value=10000, step=500, min_value=100,
-        help="The total amount of money MarketMind will manage. Think of it as your trading 'pot'.\n\n"
-             "• No new money is added for 6 months after setup.\n"
-             "• Profits from trades are reinvested automatically (compounding).\n"
-             "• Only invest what you can afford to lose entirely.",
-    )
-    new_persona = st.selectbox(
-        "Trading persona",
-        ["swing", "day", "longterm"],
-        format_func=lambda x: {
-            "day":      "⚡ Day Trading — same-day exits, +1.5% target",
-            "swing":    "🔄 Swing Trading — 2–5 day holds, +5% target",
-            "longterm": "📈 Long-term Investing — 3–12 month holds, +25% target",
-        }[x],
-        key="new_persona",
-        help="Your trading style — this is the most important setting.\n\n"
-             "⚡ Day Trading: Buy and sell within the same day. Very tight stop-loss (0.75%). "
-             "Focuses on volume spikes and momentum. High frequency, small gains.\n\n"
-             "🔄 Swing Trading: Hold for 2–5 days. Capture short-term price moves of 3–8%. "
-             "Uses RSI, MACD, and Bollinger Band signals.\n\n"
-             "📈 Long-term Investing: Hold for months. Focuses on fundamentals — P/E ratio, "
-             "analyst ratings, profit margins. Wide stop-loss (8%) to ride out volatility.",
-    )
+# ── Authentication gate ───────────────────────────────────────────────────────
+if st.session_state.authenticated_profile is None:
+    st.sidebar.subheader("👤 Profile")
+    _login_tab, _create_tab = st.sidebar.tabs(["Login", "Create"])
 
-    # Show what the persona sets
-    _pcfg = mm.PERSONA_CONFIGS[new_persona]
-    st.caption(
-        f"{_pcfg['emoji']} **{_pcfg['label']}** — {_pcfg['description']}  \n"
-        f"Take-profit: **+{_pcfg['take_profit_pct']}%**  |  "
-        f"Stop-loss: **−{_pcfg['stop_loss_pct']}%**  |  "
-        f"Max hold: **{_pcfg['hold_label']}**  |  "
-        f"Max trades: **{_pcfg['max_open_trades']}**"
-    )
-
-    new_risk = st.selectbox(
-        "Risk appetite",
-        ["moderate", "conservative", "aggressive"],
-        key="new_risk",
-        help="Controls how aggressively MarketMind trades.\n\n"
-             "• Conservative — stable stocks, tight stop-loss (-1.5%), take-profit at +3%\n"
-             "• Moderate — balanced mix, stop-loss -2%, take-profit +5%\n"
-             "• Aggressive — high-volatility momentum stocks, stop-loss -3%, take-profit +8%",
-    )
-    new_tax = st.selectbox(
-        "Federal tax bracket",
-        [10, 12, 22, 24, 32, 35, 37],
-        index=2,
-        key="new_tax",
-        help="Your marginal federal income tax rate.\n\n"
-             "Used to estimate capital gains tax on trade recommendations.\n"
-             "• Short-term gains (held < 1 year) are taxed at this rate.\n"
-             "• Long-term gains (held ≥ 1 year) are taxed at 0%, 15%, or 20%.\n\n"
-             "Not sure? Most people are in the 22% or 24% bracket.",
-    )
-
-    # Risk level summary so user sees what they're choosing
-    _tp = {"conservative": 3.0, "moderate": 5.0, "aggressive": 8.0}[new_risk]
-    _sl = {"conservative": 1.5, "moderate": 2.0, "aggressive": 3.0}[new_risk]
-    st.caption(f"Take-profit: **+{_tp}%**  |  Stop-loss: **−{_sl}%**  |  Max 5 open trades  |  Max 20% per trade")
-
-    if st.button("Create profile"):
-        if new_name.strip():
-            _name    = new_name.strip()
-            _state   = create_profile(_name, float(new_capital), new_risk, float(new_tax), new_persona)
-            _pcfg    = mm.PERSONA_CONFIGS[new_persona]
-            _lt_rate = "0%" if new_tax <= 12 else ("15%" if new_tax <= 35 else "20%")
-            st.success(f"✓ Profile **{_name}** created!")
-            st.info(
-                f"**Your profile at a glance:**\n\n"
-                f"- **Persona:** {_pcfg['emoji']} {_pcfg['label']} — {_pcfg['tagline']}  \n"
-                f"- **Budget:** ${float(new_capital):,.0f}  \n"
-                f"- **Risk:** {new_risk.capitalize()}  \n"
-                f"- **Take-profit:** +{_pcfg['take_profit_pct']}%  |  "
-                f"**Stop-loss:** −{_pcfg['stop_loss_pct']}%  |  "
-                f"**Max hold:** {_pcfg['hold_label']}  \n"
-                f"- **Tax bracket:** {new_tax}% short-term / {_lt_rate} long-term  \n"
-                f"- **Period:** {_state['start_date']} → {_state['end_date']}"
-            )
-            st.session_state["active_profile"] = _name
-            st.rerun()
+    with _login_tab:
+        if existing:
+            _login_name = st.selectbox("Select profile", existing, key="login_select")
+            _login_pin  = st.text_input("PIN", type="password", max_chars=8, key="login_pin",
+                                        placeholder="Leave blank for legacy profiles")
+            if st.button("Login", key="btn_login"):
+                if verify_pin(_login_name, _login_pin):
+                    st.session_state.authenticated_profile = _login_name
+                    st.session_state["active_profile"] = _login_name
+                    st.rerun()
+                else:
+                    st.error("Incorrect PIN.")
         else:
-            st.warning("Enter a profile name.")
+            st.info("No profiles yet. Create one in the **Create** tab.")
 
-if not existing:
-    st.sidebar.warning("No profiles yet. Create one above.")
+    with _create_tab:
+        new_name    = st.text_input("Profile name", placeholder="e.g. My Growth Fund", key="new_name_auth")
+        new_pin     = st.text_input("PIN (4–8 digits)", type="password", max_chars=8,
+                                    placeholder="e.g. 1234", key="new_pin_auth")
+        new_pin2    = st.text_input("Confirm PIN", type="password", max_chars=8, key="new_pin2_auth")
+        new_capital = st.number_input("Starting budget ($)", value=10000, step=500, min_value=100, key="new_cap_auth")
+        new_persona = st.selectbox(
+            "Trading persona", ["swing", "day", "longterm"],
+            format_func=lambda x: {
+                "day":      "⚡ Day Trading",
+                "swing":    "🔄 Swing Trading",
+                "longterm": "📈 Long-term Investing",
+            }[x],
+            key="new_persona_auth",
+        )
+        new_risk = st.selectbox("Risk appetite", ["moderate", "conservative", "aggressive"], key="new_risk_auth")
+        new_tax  = st.selectbox("Federal tax bracket", [10, 12, 22, 24, 32, 35, 37], index=2, key="new_tax_auth")
+
+        if st.button("Create & Login", key="btn_create_auth"):
+            if not new_name.strip():
+                st.warning("Enter a profile name.")
+            elif len(new_pin.strip()) < 4:
+                st.warning("PIN must be at least 4 digits.")
+            elif new_pin != new_pin2:
+                st.error("PINs do not match.")
+            else:
+                _name  = new_name.strip()
+                create_profile(_name, float(new_capital), new_risk, float(new_tax), new_persona, new_pin)
+                st.session_state.authenticated_profile = _name
+                st.session_state["active_profile"] = _name
+                st.success(f"Profile **{_name}** created!")
+                st.rerun()
+
     st.stop()
 
-# Default to last-created profile (or session state), else first in list
-_default_profile = st.session_state.get("active_profile", existing[0])
-_default_index   = existing.index(_default_profile) if _default_profile in existing else 0
-active_profile   = st.sidebar.selectbox("Active profile", existing, index=_default_index)
-profile_state  = load_profile(active_profile)
+# ── Logged-in sidebar ─────────────────────────────────────────────────────────
+active_profile = st.session_state.authenticated_profile
+
+# Refresh profile list (may have changed) and allow switching within session
+existing = list_profiles()
+st.sidebar.subheader("👤 Profile")
+_default_index = existing.index(active_profile) if active_profile in existing else 0
+_switched = st.sidebar.selectbox("Active profile", existing, index=_default_index, key="profile_switcher")
+if _switched != active_profile:
+    # Require re-authentication when switching profiles
+    st.session_state.authenticated_profile = None
+    st.session_state["active_profile"] = _switched
+    st.rerun()
+
+if st.sidebar.button("Logout", key="btn_logout"):
+    st.session_state.authenticated_profile = None
+    st.rerun()
+
+profile_state = load_profile(active_profile)
 
 # Point the agent at this profile's state file
 mm.PORTFOLIO_STATE_FILE = profile_path(active_profile)
