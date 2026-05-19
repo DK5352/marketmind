@@ -7,6 +7,8 @@
 # Personal portfolio data
 portfolio_state.json
 profiles/
+profiles.json
+user_data/
 
 # Generated reports (optional — remove these lines if you want reports in git)
 reports/

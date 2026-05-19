@@ -1,6 +1,7 @@
+streamlit
 yfinance
+pandas
+anthropic
 python-dotenv
 python-dateutil
-streamlit
 pdfplumber
-pandas

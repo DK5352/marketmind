@@ -82,6 +82,148 @@ from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 
 import yfinance as yf
+try:
+    import anthropic as _anthropic
+except ImportError:
+    _anthropic = None  # type: ignore
+
+
+# ── Ask MarketMind — conversational AI powered by Claude ─────────────────────
+
+def ask_mastermind(
+    question: str,
+    portfolio_state: dict,
+    conversation_history: list[dict] | None = None,
+    ticker_context: str | None = None,
+) -> str:
+    """
+    Ask the MarketMind AI a free-form question about markets, your portfolio,
+    or any trading topic.
+
+    Args:
+        question:             The user's question in plain English.
+        portfolio_state:      The active profile's portfolio_state dict.
+        conversation_history: List of {"role": "user"|"assistant", "content": str}
+                              from earlier in this session (for multi-turn).
+        ticker_context:       Optional ticker the user is currently viewing
+                              (adds live technicals to the prompt automatically).
+
+    Returns:
+        The AI's answer as a plain string.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return (
+            "⚠️ ANTHROPIC_API_KEY not found. "
+            "Add it to your .env file or Streamlit secrets to enable Ask Mastermind."
+        )
+    if _anthropic is None:
+        return "⚠️ anthropic package not installed. Run: pip install anthropic"
+
+    # ── Build portfolio context ───────────────────────────────────────────────
+    holdings    = portfolio_state.get("holdings", {})
+    cash        = portfolio_state.get("cash_available", 0)
+    total_val   = portfolio_state.get("total_portfolio_value", 0)
+    risk_level  = portfolio_state.get("risk_level", "moderate")
+    tax_bracket = portfolio_state.get("tax_bracket_pct", 22)
+    tp_pct      = portfolio_state.get("take_profit_pct", 5)
+    sl_pct      = portfolio_state.get("stop_loss_pct", 2)
+    total_ret   = portfolio_state.get("total_return_pct", 0)
+
+    portfolio_lines = [
+        f"Portfolio value: ${total_val:,.2f}  |  Cash: ${cash:,.2f}  |  "
+        f"Total return: {total_ret:+.2f}%",
+        f"Risk level: {risk_level}  |  Take-profit: +{tp_pct}%  |  "
+        f"Stop-loss: -{sl_pct}%  |  Tax bracket: {int(tax_bracket)}%",
+    ]
+    if holdings:
+        portfolio_lines.append("Current holdings:")
+        for ticker, pos in holdings.items():
+            pct = pos.get("unrealized_pct", 0)
+            portfolio_lines.append(
+                f"  {ticker}: {pos.get('shares', 0):.2f} shares  "
+                f"avg ${pos.get('avg_buy_price', 0):.2f}  "
+                f"now ${pos.get('current_price', pos.get('avg_buy_price', 0)):.2f}  "
+                f"P&L {pct:+.1f}%"
+            )
+    else:
+        portfolio_lines.append("No holdings yet.")
+
+    # ── Optional: live ticker context ─────────────────────────────────────────
+    ticker_lines = []
+    if ticker_context:
+        try:
+            tech = get_technical_indicators(ticker_context)
+            fund = get_fundamentals(ticker_context)
+            if not tech.get("error"):
+                ticker_lines = [
+                    f"\nLive data for {ticker_context}:",
+                    f"  Price: ${tech.get('current_price', 'N/A')}  "
+                    f"RSI: {tech.get('rsi_14d', 'N/A')}  "
+                    f"MACD: {tech.get('macd_signal', 'N/A')}",
+                    f"  EMA200: ${tech.get('ema_200d', 'N/A')}  "
+                    f"BB position: {tech.get('bb_price_position_pct', 'N/A')}th %ile",
+                ]
+            if not fund.get("error"):
+                ticker_lines.append(
+                    f"  P/E: {fund.get('pe_ratio', 'N/A')}  "
+                    f"Analyst target: ${fund.get('analyst_target_price', 'N/A')}  "
+                    f"Rating: {(fund.get('analyst_rating') or 'N/A').replace('_', ' ').title()}"
+                )
+        except Exception:
+            pass
+
+    # ── System prompt ─────────────────────────────────────────────────────────
+    system_prompt = f"""You are MarketMind — a personal AI wealth manager and trading coach.
+You speak like a knowledgeable friend who happens to be a stock market expert:
+clear, direct, and jargon-free unless the user clearly knows the terms.
+
+Today's date: {date.today().strftime('%B %d, %Y')}
+
+USER'S PORTFOLIO CONTEXT:
+{chr(10).join(portfolio_lines)}
+{chr(10).join(ticker_lines)}
+
+Your role:
+- Answer questions about the user's portfolio, specific stocks, market conditions,
+  trading strategies, options basics, tax implications, and investing concepts.
+- Give specific, actionable answers — not generic disclaimers.
+- When discussing tax (short-term vs long-term gains, wash-sale rule, etc.),
+  use the user's actual tax bracket ({int(tax_bracket)}%).
+- When asked about a stock they hold, reference their actual position.
+- When asked about buy/sell decisions, frame it in terms of their risk level ({risk_level})
+  and their take-profit (+{tp_pct}%) / stop-loss (-{sl_pct}%) thresholds.
+- Use bullet points for multi-part answers. Keep responses concise (under 250 words)
+  unless a topic genuinely needs depth.
+- Always end with one concrete next step or key takeaway.
+- Remind the user this is educational, not licensed financial advice — but only once
+  per session, not on every reply.
+
+STOCK MARKET EXPERT PERSPECTIVE:
+- Pre-market conditions matter: gap risk, futures direction, VIX level.
+- Technical signals are guides, not guarantees — always respect the stop-loss.
+- Time horizon determines everything: a day trader and a long-term investor
+  should react differently to the same signal.
+- Tax efficiency is part of the return — factor it in.
+- Position sizing (never risk more than 2% of capital per trade) is how
+  professionals survive long-term.
+"""
+
+    # ── Build messages and call Claude ────────────────────────────────────────
+    messages = list(conversation_history or [])
+    messages.append({"role": "user", "content": question})
+
+    try:
+        client   = _anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model      = "claude-sonnet-4-6",
+            max_tokens = 1024,
+            system     = system_prompt,
+            messages   = messages,
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        return f"⚠️ MarketMind could not answer right now: {e}"
 
 
 # ── Trading Configuration ─────────────────────────────────────────────────────

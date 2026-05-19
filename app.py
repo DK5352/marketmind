@@ -45,51 +45,85 @@ st.set_page_config(
     layout="wide",
 )
 
-PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
-os.makedirs(PROFILES_DIR, exist_ok=True)
+PROFILES_FILE = os.path.join(os.path.dirname(__file__), "profiles.json")
+USER_DATA_DIR  = os.path.join(os.path.dirname(__file__), "user_data")
+os.makedirs(USER_DATA_DIR, exist_ok=True)
 
 
 # ── Profile helpers ───────────────────────────────────────────────────────────
 
-def profile_path(name: str) -> str:
-    return os.path.join(PROFILES_DIR, f"portfolio_{name.lower()}.json")
+def save_profiles(profiles: dict) -> None:
+    with open(PROFILES_FILE, "w") as f:
+        json.dump(profiles, f, indent=2)
 
 
-def list_profiles() -> list[str]:
-    """
-    Returns profile names sorted alphabetically.
-    Reads the display name from inside the JSON (profile_name field) to
-    preserve original casing (e.g. 'DK' stays 'DK', not 'Dk').
-    Falls back to the filename if the field is missing.
-    """
-    files = [f for f in os.listdir(PROFILES_DIR) if f.startswith("portfolio_") and f.endswith(".json")]
-    names = []
-    for f in sorted(files):
-        try:
-            with open(os.path.join(PROFILES_DIR, f)) as fh:
-                data = json.load(fh)
-            names.append(data.get("profile_name") or f.replace("portfolio_", "").replace(".json", "").capitalize())
-        except Exception:
-            names.append(f.replace("portfolio_", "").replace(".json", "").capitalize())
-    return names
-
-
-def load_profile(name: str) -> dict:
-    path = profile_path(name)
-    if os.path.exists(path):
-        with open(path) as f:
+def load_profiles() -> dict:
+    if os.path.exists(PROFILES_FILE):
+        with open(PROFILES_FILE) as f:
             return json.load(f)
+    # One-time migration from old per-file layout
+    old_dir = os.path.join(os.path.dirname(__file__), "profiles")
+    if os.path.isdir(old_dir):
+        migrated = {}
+        for fname in sorted(os.listdir(old_dir)):
+            if fname.startswith("portfolio_") and fname.endswith(".json"):
+                try:
+                    with open(os.path.join(old_dir, fname)) as fh:
+                        data = json.load(fh)
+                    pname = data.get("profile_name") or fname.replace("portfolio_", "").replace(".json", "").capitalize()
+                    migrated[pname] = data
+                except Exception:
+                    pass
+        if migrated:
+            save_profiles(migrated)
+        return migrated
     return {}
 
 
+def _mm_state_path(name: str) -> str:
+    return os.path.join(USER_DATA_DIR, f"{name.lower()}_portfolio.json")
+
+
+def list_profiles() -> list[str]:
+    return sorted(st.session_state.profiles.keys())
+
+
+def load_profile(name: str) -> dict:
+    return st.session_state.profiles.get(name, {})
+
+
 def save_profile(name: str, state: dict) -> None:
-    with open(profile_path(name), "w") as f:
+    st.session_state.profiles[name] = state
+    save_profiles(st.session_state.profiles)
+    with open(_mm_state_path(name), "w") as f:
         json.dump(state, f, indent=2)
 
 
+_PAGES: dict[str, str] = {
+    "portfolio":          "Portfolio",
+    "daily_trade_scan":   "Daily Trade Scan",
+    "new_opportunities":  "New Opportunities",
+    "pre_bell_scanner":   "Pre-Bell Scanner",
+    "ask_marketmind":     "Ask MarketMind",
+    "tax_calculator":     "Tax Calculator",
+    "stock_forecast":     "Stock Forecast",
+    "top_10_snapshot":    "Top 10 Snapshot",
+    "backtest":           "Backtest",
+}
+
+
 def _init_session() -> None:
+    if "profiles" not in st.session_state:
+        st.session_state.profiles = load_profiles()
     if "authenticated_profile" not in st.session_state:
         st.session_state.authenticated_profile = None
+    if "page" not in st.session_state:
+        st.session_state.page = "portfolio"
+
+
+def go_to(page_name: str) -> None:
+    st.session_state.page = page_name
+    st.rerun()
 
 
 def verify_pin(name: str, pin: str) -> bool:
@@ -491,7 +525,7 @@ if st.sidebar.button("Logout", key="btn_logout"):
 profile_state = load_profile(active_profile)
 
 # Point the agent at this profile's state file
-mm.PORTFOLIO_STATE_FILE = profile_path(active_profile)
+mm.PORTFOLIO_STATE_FILE = _mm_state_path(active_profile)
 
 st.sidebar.markdown("---")
 
@@ -544,10 +578,13 @@ st.sidebar.caption(f"{'✅' if profile_state.get('robinhood_imported') else '⬜
 
 # Mode nav
 st.sidebar.markdown("---")
-mode = st.sidebar.radio(
-    "Mode",
-    ["Portfolio", "Daily Trade Scan", "Pre-Bell Scanner", "Ask MarketMind", "Tax Calculator", "Stock Forecast", "Top 10 Snapshot", "Backtest"],
-)
+_page_keys   = list(_PAGES.keys())
+_page_labels = list(_PAGES.values())
+_page_index  = _page_keys.index(st.session_state.page) if st.session_state.page in _page_keys else 0
+_selected_label = st.sidebar.radio("Mode", _page_labels, index=_page_index)
+_selected_key   = _page_keys[_page_labels.index(_selected_label)]
+if _selected_key != st.session_state.page:
+    go_to(_selected_key)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("⚠️ Educational purposes only. Not financial advice.")
@@ -556,7 +593,7 @@ st.sidebar.caption("⚠️ Educational purposes only. Not financial advice.")
 # ══════════════════════════════════════════════════════════════════════════════
 # PORTFOLIO — upload Robinhood data + view holdings
 # ══════════════════════════════════════════════════════════════════════════════
-if mode == "Portfolio":
+def show_portfolio():
     st.title(f"💼 Portfolio — {active_profile}")
     st.markdown(
         f"**Your command centre.** This is where you see everything you currently own, "
@@ -585,6 +622,10 @@ if mode == "Portfolio":
     )
 
     if uploaded:
+        raw_path = os.path.join(USER_DATA_DIR, f"{active_profile}_{uploaded.name}")
+        with open(raw_path, "wb") as _fh:
+            _fh.write(uploaded.getvalue())
+
         with st.spinner("Parsing Robinhood data..."):
             result = parse_robinhood_file(uploaded)
 
@@ -966,7 +1007,7 @@ if mode == "Portfolio":
 # ══════════════════════════════════════════════════════════════════════════════
 # PRE-BELL SCANNER
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Pre-Bell Scanner":
+def show_pre_bell_scanner():
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
     now_et = datetime.now(tz=_ET)
@@ -1199,84 +1240,14 @@ elif mode == "Pre-Bell Scanner":
 # ══════════════════════════════════════════════════════════════════════════════
 # ASK MARKETMIND — conversational follow-up Q&A
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Ask MarketMind":
-    import anthropic as _anthropic
-
+def show_ask_marketmind():
     st.title("💬 Ask MarketMind")
     st.caption(
         "Ask anything about your portfolio, today's signals, pre-market conditions, "
         "or general trading questions. MarketMind answers with your live data as context."
     )
 
-    # ── Build context snapshot for Claude ────────────────────────────────────
-    holdings      = profile_state.get("holdings", {})
-    cash          = profile_state.get("cash_available", 0)
-    total_val     = profile_state.get("total_portfolio_value", 0)
-    risk_level    = profile_state.get("risk_level", "moderate")
-    take_profit   = profile_state.get("take_profit_pct", 5.0)
-    stop_loss     = profile_state.get("stop_loss_pct", 2.0)
-
-    def _build_system_prompt() -> str:
-        _pcfg = mm.PERSONA_CONFIGS.get(_persona_key, mm.PERSONA_CONFIGS["swing"])
-        _weights = _pcfg["weights"]
-        _top_signals = sorted(_weights.items(), key=lambda kv: -kv[1])
-        _signal_priority = ", ".join(
-            f"{k} (weight {v})" for k, v in _top_signals if v > 0
-        )
-        lines = [
-            f"You are MarketMind, an expert AI trading assistant.",
-            f"The user's active trading persona is: {_pcfg['emoji']} {_pcfg['label']}.",
-            f"Persona tagline: \"{_pcfg['tagline']}\"",
-            f"Prioritised signals for this persona: {_signal_priority}.",
-            f"What this persona focuses on: {', '.join(_pcfg['focus'])}.",
-            f"What this persona avoids: {', '.join(_pcfg['avoid'])}.",
-            f"Calibrate ALL advice to this persona — a day trader does not want to hear about P/E ratios; "
-            f"a long-term investor does not care about intraday volume spikes.",
-            "Be direct, concise, and practical. Always caveat: educational only, not licensed financial advice.",
-            "",
-            f"=== PROFILE: {active_profile} ===",
-            f"Trading persona: {_pcfg['emoji']} {_pcfg['label']} — take-profit +{take_profit}%, stop-loss -{stop_loss}%",
-            f"Max hold period: {_pcfg['hold_label']}  |  Max open trades: {_pcfg['max_open_trades']}",
-            f"Risk level: {risk_level}",
-            f"Cash available: ${cash:,.2f}",
-            f"Total portfolio value: ${total_val:,.2f}",
-            f"Today's date: {date.today().strftime('%A, %B %d, %Y')}",
-        ]
-
-        if holdings:
-            lines.append("\n=== CURRENT HOLDINGS ===")
-            for ticker, pos in holdings.items():
-                unreal     = pos.get("unrealized_pnl", 0)
-                unreal_pct = pos.get("unrealized_pct", 0)
-                shares     = pos.get("shares", 0)
-                avg_buy    = pos.get("avg_buy_price", 0)
-                cur_price  = pos.get("current_price", avg_buy)
-                lines.append(
-                    f"  {ticker}: {shares} shares @ avg ${avg_buy:.2f} | "
-                    f"current ${cur_price:.2f} | P&L ${unreal:+,.2f} ({unreal_pct:+.1f}%)"
-                )
-        else:
-            lines.append("\n=== HOLDINGS: none imported yet ===")
-
-        # Attach pre-bell scan results if they exist in session state
-        if "prebell_signals" in st.session_state and st.session_state.prebell_signals:
-            lines.append("\n=== LATEST PRE-BELL SCAN RESULTS ===")
-            for s in st.session_state.prebell_signals:
-                g = s["gap"]
-                t = s["tech"]
-                gap_str = f"gap {g.gap_pct:+.2f}% ({g.gap_risk.value} risk)" if g.data_available else "no PM data"
-                rsi_str = f"RSI {t.get('rsi_14d','?')}" if not t.get("error") else "tech N/A"
-                lines.append(
-                    f"  {s['ticker']}: signal={s['signal']} | {gap_str} | {rsi_str} | {s['reason'][:80]}"
-                )
-
-        lines += [
-            "",
-            "Answer the user's question using this context where relevant.",
-            "If asked about a ticker not in the portfolio or scan, fetch what you know from training.",
-            "Keep answers focused — traders need clarity, not essays.",
-        ]
-        return "\n".join(lines)
+    holdings = profile_state.get("holdings", {})
 
     # ── Session state for chat history ────────────────────────────────────────
     chat_key = f"chat_history_{active_profile}"
@@ -1298,7 +1269,6 @@ elif mode == "Ask MarketMind":
             if col.button(q, use_container_width=True):
                 st.session_state[chat_key].append({"role": "user", "content": q})
                 st.rerun()
-
         st.markdown("---")
 
     # ── Render chat history ───────────────────────────────────────────────────
@@ -1312,31 +1282,16 @@ elif mode == "Ask MarketMind":
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # Call Claude
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            with st.chat_message("assistant"):
-                st.error("ANTHROPIC_API_KEY not set. Add it to your .env file.")
-        else:
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking…"):
-                    try:
-                        client = _anthropic.Anthropic(api_key=api_key)
-                        response = client.messages.create(
-                            model="claude-opus-4-6",
-                            max_tokens=1024,
-                            system=_build_system_prompt(),
-                            messages=[
-                                {"role": m["role"], "content": m["content"]}
-                                for m in st.session_state[chat_key]
-                            ],
-                        )
-                        reply = response.content[0].text
-                    except Exception as e:
-                        reply = f"❌ Error calling Claude: {e}"
-
-                st.markdown(reply)
-                st.session_state[chat_key].append({"role": "assistant", "content": reply})
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                history = st.session_state[chat_key][:-1]  # exclude the message just appended
+                reply   = mm.ask_mastermind(
+                    question             = user_input,
+                    portfolio_state      = profile_state,
+                    conversation_history = history,
+                )
+            st.markdown(reply)
+            st.session_state[chat_key].append({"role": "assistant", "content": reply})
 
     # ── Sidebar controls ──────────────────────────────────────────────────────
     with st.sidebar:
@@ -1347,14 +1302,12 @@ elif mode == "Ask MarketMind":
         st.caption(f"{len(st.session_state[chat_key])} messages in this session")
         if holdings:
             st.caption(f"Context includes {len(holdings)} holdings")
-        if "prebell_signals" in st.session_state and st.session_state.prebell_signals:
-            st.caption(f"+ {len(st.session_state.prebell_signals)} pre-bell signals")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAX CALCULATOR
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Tax Calculator":
+def show_tax_calculator():
     st.title("🧾 Tax Calculator")
     st.markdown(
         "**Estimates how much tax you'd owe if you sold your positions today.**  \n\n"
@@ -1591,7 +1544,7 @@ elif mode == "Tax Calculator":
 # ══════════════════════════════════════════════════════════════════════════════
 # DAILY TRADE SCAN
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Daily Trade Scan":
+def show_daily_trade_scan():
     _scan_meta = {
         "day": {
             "title":   "⚡ Daily Trade Scan — Day Trading Mode",
@@ -1724,53 +1677,12 @@ elif mode == "Daily Trade Scan":
         path = mm._save_daily_report(report)
         st.caption(f"Saved: {path}")
 
-        # ── New Opportunities ──────────────────────────────────────────────────
+        # ── New Opportunities shortcut ─────────────────────────────────────────
         st.markdown("---")
         st.subheader("💡 New Opportunities")
-        st.caption(
-            "Stocks beyond your current holdings with bullish signals — "
-            "scanned across 11 sectors (~165 stocks)."
-        )
-
-        held_tickers = list(profile_state.get("holdings", {}).keys())
-        opp_col1, opp_col2 = st.columns([2, 1])
-        with opp_col1:
-            run_opps = st.button("▶  Find Opportunities", key="btn_opps")
-        with opp_col2:
-            st.caption("Takes ~2 min (165 stocks)")
-
-        if run_opps:
-            with st.spinner("Scanning 165 stocks across 11 sectors..."):
-                opps = mm.find_new_opportunities(held_tickers, n=10)
-
-            if opps:
-                st.success(f"Found {len(opps)} opportunity candidates")
-                opp_rows = []
-                for o in opps:
-                    opp_rows.append({
-                        "Ticker":      o["ticker"],
-                        "Sector":      o["sector"],
-                        "Signal":      o["signal"],
-                        "Score":       o["bull_score"],
-                        "Price":       f"${o['price']:.2f}",
-                        "RSI":         o["rsi"],
-                        "MACD":        o["macd"],
-                        "Volume":      f"{o['volume']:.1f}x",
-                        "Sentiment":   o["sentiment"],
-                        "Take-Profit": f"${o['take_profit']:.2f}",
-                        "Stop-Loss":   f"${o['stop_loss']:.2f}",
-                        "Why":         o["reason"],
-                    })
-                st.dataframe(pd.DataFrame(opp_rows), use_container_width=True, hide_index=True)
-
-                # Tax note on new buys
-                st.info(
-                    "**Tax note on new buys:** Any position you open today starts the holding-period clock. "
-                    f"If sold within 1 year, gains are taxed at your short-term rate ({int(tax_bracket)}%). "
-                    "Holding ≥1 year qualifies for lower long-term rates (0/15/20%)."
-                )
-            else:
-                st.warning("No high-confidence opportunities found today. Market conditions may be unfavorable.")
+        st.caption("Stocks beyond your holdings with bullish signals — scanned across 11 sectors (~165 stocks).")
+        if st.button("Find New Opportunities →", key="btn_new_opps"):
+            go_to("new_opportunities")
 
         # ── Portfolio Balance ──────────────────────────────────────────────────
         st.markdown("---")
@@ -1813,7 +1725,7 @@ elif mode == "Daily Trade Scan":
 # ══════════════════════════════════════════════════════════════════════════════
 # STOCK FORECAST
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Stock Forecast":
+def show_stock_forecast():
     _sf_desc = {
         "day": (
             "**Research before you trade.** Heard about a stock on the news or social media? "
@@ -1838,53 +1750,12 @@ elif mode == "Stock Forecast":
 
     tab_recs, tab_analyse = st.tabs(["💡 Stock Recommendations", "🔎 Analyse a Stock"])
 
-    # ── Tab 1: Stock Recommendations ─────────────────────────────────────────
+    # ── Tab 1: Stock Recommendations shortcut ────────────────────────────────
     with tab_recs:
         st.subheader("💡 Stock Recommendations")
-        _rec_cap = {
-            "day":      "Scans ~165 stocks for volume spikes and intraday momentum setups — day-trade candidates.",
-            "swing":    "Scans ~165 stocks across 11 sectors for bullish setups you don't already hold.",
-            "longterm": "Scans ~165 stocks for quality companies above their 200-day EMA with strong analyst ratings.",
-        }
-        st.caption(_rec_cap.get(_persona_key, _rec_cap["swing"]))
-
-        held_tickers = list(profile_state.get("holdings", {}).keys())
-
-        rec_col1, rec_col2 = st.columns([2, 1])
-        with rec_col1:
-            run_recs = st.button("▶  Find Stocks to Buy", type="primary", use_container_width=True)
-        with rec_col2:
-            st.caption("Takes ~2 min")
-
-        if run_recs:
-            with st.spinner("Scanning 165 stocks across 11 sectors..."):
-                opps = mm.find_new_opportunities(held_tickers, n=15)
-
-            if opps:
-                st.success(f"Found {len(opps)} buy candidates")
-                opp_rows = []
-                for o in opps:
-                    opp_rows.append({
-                        "Ticker":      o["ticker"],
-                        "Sector":      o["sector"],
-                        "Signal":      o["signal"],
-                        "Score":       o["bull_score"],
-                        "Price":       f"${o['price']:.2f}",
-                        "RSI":         o["rsi"],
-                        "MACD":        o["macd"],
-                        "Volume":      f"{o['volume']:.1f}x",
-                        "Sentiment":   o["sentiment"],
-                        "Take-Profit": f"${o['take_profit']:.2f}",
-                        "Stop-Loss":   f"${o['stop_loss']:.2f}",
-                        "Why":         o["reason"],
-                    })
-                st.dataframe(pd.DataFrame(opp_rows), use_container_width=True, hide_index=True)
-                st.info(
-                    f"**Tax note on new buys:** Positions opened today start the 1-year holding clock. "
-                    f"Short-term rate: {int(tax_bracket)}%. Holding ≥1 year qualifies for lower long-term rates."
-                )
-            else:
-                st.warning("No high-confidence opportunities found today. Market conditions may be unfavorable.")
+        st.caption("Scans ~165 stocks across 11 sectors for bullish setups you don't already hold.")
+        if st.button("Go to New Opportunities →", key="btn_sf_opps", type="primary", use_container_width=True):
+            go_to("new_opportunities")
 
     # ── Tab 2: Analyse a specific stock ──────────────────────────────────────
     with tab_analyse:
@@ -1989,7 +1860,7 @@ elif mode == "Stock Forecast":
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP 10 SNAPSHOT
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Top 10 Snapshot":
+def show_top_10_snapshot():
     st.title("🏆 Top 10 US Stocks Snapshot")
     st.markdown(
         "**A live pulse check on the 10 biggest companies in the US stock market.** "
@@ -2045,7 +1916,7 @@ elif mode == "Top 10 Snapshot":
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKTEST
 # ══════════════════════════════════════════════════════════════════════════════
-elif mode == "Backtest":
+def show_backtest():
     from datetime import timedelta
     st.title("🔬 Backtest MarketMind Predictions")
     st.markdown(
@@ -2117,3 +1988,79 @@ elif mode == "Backtest":
             s1, s2 = st.columns(2)
             s1.metric("Direction Accuracy", f"{correct}/{total} correct")
             s2.metric("Hit Rate", f"{correct/total*100:.0f}%")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW OPPORTUNITIES
+# ══════════════════════════════════════════════════════════════════════════════
+def show_new_opportunities():
+    st.title(f"💡 New Opportunities — {active_profile}")
+    _cap = {
+        "day":      "Scans ~165 stocks for volume spikes and intraday momentum setups — day-trade candidates.",
+        "swing":    "Scans ~165 stocks across 11 sectors for bullish setups you don't already hold.",
+        "longterm": "Scans ~165 stocks for quality companies above their 200-day EMA with strong analyst ratings.",
+    }
+    st.markdown(_cap.get(_persona_key, _cap["swing"]))
+
+    if st.button("← Back to Daily Scan", key="btn_opps_back"):
+        go_to("daily_trade_scan")
+
+    st.markdown("---")
+    held_tickers = list(profile_state.get("holdings", {}).keys())
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        run_opps = st.button("▶  Find Opportunities", type="primary", use_container_width=True, key="btn_run_opps")
+    with col2:
+        st.caption("Takes ~2 min (165 stocks)")
+
+    if run_opps:
+        with st.spinner("Scanning 165 stocks across 11 sectors..."):
+            opps = mm.find_new_opportunities(held_tickers, n=15)
+
+        if opps:
+            st.success(f"Found {len(opps)} opportunity candidates")
+            opp_rows = []
+            for o in opps:
+                opp_rows.append({
+                    "Ticker":      o["ticker"],
+                    "Sector":      o["sector"],
+                    "Signal":      o["signal"],
+                    "Score":       o["bull_score"],
+                    "Price":       f"${o['price']:.2f}",
+                    "RSI":         o["rsi"],
+                    "MACD":        o["macd"],
+                    "Volume":      f"{o['volume']:.1f}x",
+                    "Sentiment":   o["sentiment"],
+                    "Take-Profit": f"${o['take_profit']:.2f}",
+                    "Stop-Loss":   f"${o['stop_loss']:.2f}",
+                    "Why":         o["reason"],
+                })
+            st.dataframe(pd.DataFrame(opp_rows), use_container_width=True, hide_index=True)
+            st.info(
+                "**Tax note on new buys:** Any position you open today starts the holding-period clock. "
+                f"Short-term gains taxed at your rate ({int(tax_bracket)}%). "
+                "Holding ≥1 year qualifies for lower long-term rates (0/15/20%)."
+            )
+        else:
+            st.warning("No high-confidence opportunities found today. Market conditions may be unfavorable.")
+
+
+# ── Router ────────────────────────────────────────────────────────────────────
+_ROUTER = {
+    "portfolio":         show_portfolio,
+    "daily_trade_scan":  show_daily_trade_scan,
+    "new_opportunities": show_new_opportunities,
+    "pre_bell_scanner":  show_pre_bell_scanner,
+    "ask_marketmind":    show_ask_marketmind,
+    "tax_calculator":    show_tax_calculator,
+    "stock_forecast":    show_stock_forecast,
+    "top_10_snapshot":   show_top_10_snapshot,
+    "backtest":          show_backtest,
+}
+
+_current_page = st.session_state.get("page", "portfolio")
+if _current_page in _ROUTER:
+    _ROUTER[_current_page]()
+else:
+    go_to("portfolio")
